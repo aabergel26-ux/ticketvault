@@ -460,18 +460,30 @@ function parseTicketmasterTicket(msg: GmailMessage): Ticket | null {
   const city = venueMatch?.[2]?.trim() ?? '';
 
   // ── Date ──
-  // Classic: "Fri · Jul 25, 2025 · 8:00 PM"
-  const classicDate = text.match(/(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\w*\s*[·•]\s*(\w+)\s+(\d{1,2}),?\s*(\d{4})\s*[·•@]\s*(\d{1,2}:\d{2}\s*[AP]M)/i);
-  // Resale: "Wed, Dec 21 @ 7:30 PM" or "Sat • Dec 10 2022 • 5:30 PM"
+  // Use email received date's year as fallback — prevents defaulting to current year
+  const tmEmailDate = get('Date');
+  const tmEmailYear = tmEmailDate ? new Date(tmEmailDate).getFullYear() : new Date().getFullYear();
+
+  // Primary: "Month DD, YYYY" anywhere in text — year is always explicit, most reliable
+  const broadDate = text.match(/\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+(\d{1,2}),?\s*(\d{4})\b/i);
+  // Resale fallback: "Wed, Dec 21 @ 7:30 PM" — no year, use email received year
   const resaleDate = text.match(/(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\w*,?\s*(\w+)\s+(\d{1,2}),?\s*(\d{4})?\s*[@·•]\s*(\d{1,2}:\d{2}\s*[AP]M)/i);
+
   let date = new Date().toISOString().split('T')[0];
   let time = '8:00 PM';
-  const dm = classicDate ?? resaleDate;
-  if (dm) {
-    const yr = dm[3] ? parseInt(dm[3]) : new Date().getFullYear();
-    const d = new Date(`${dm[1]} ${dm[2]}, ${yr}`);
+
+  if (broadDate) {
+    // Has explicit year — most reliable
+    const d = new Date(`${broadDate[1]} ${broadDate[2]}, ${broadDate[3]}`);
     if (!isNaN(d.getTime())) date = d.toISOString().split('T')[0];
-    time = dm[4];
+    const timeNearby = text.match(/\b(\d{1,2}:\d{2}\s*[AP]M)\b/i);
+    if (timeNearby) time = timeNearby[1];
+  } else if (resaleDate) {
+    // No year in email body — use year from email received date
+    const yr = resaleDate[3] ? parseInt(resaleDate[3]) : tmEmailYear;
+    const d = new Date(`${resaleDate[1]} ${resaleDate[2]}, ${yr}`);
+    if (!isNaN(d.getTime())) date = d.toISOString().split('T')[0];
+    time = resaleDate[4];
   }
 
   // ── Order number ──
