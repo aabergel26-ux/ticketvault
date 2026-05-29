@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "outDir": ".",
+    "rootDir": ".",
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "strict": false,
+    "noEmit": false,
+    "declaration": false,
+    "verbatimModuleSyntax": true,
+    "types": ["node"]
+  },
+  "files": ["server/gmailParser.ts"]
+}
