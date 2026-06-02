@@ -51,16 +51,26 @@ function decodeBase64(data: string): string {
   return Buffer.from(data.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf-8');
 }
 
+type EmailPart = { mimeType: string; body?: { data?: string }; parts?: EmailPart[] };
+
 function extractBody(payload: GmailMessage['payload']): string {
   if (!payload) return '';
   if (payload.body?.data) return decodeBase64(payload.body.data);
-  const parts = payload.parts ?? [];
-  for (const part of parts as Array<{ mimeType: string; body?: { data?: string } }>) {
-    if ((part.mimeType === 'text/html' || part.mimeType === 'text/plain') && part.body?.data) {
-      return decodeBase64(part.body.data);
+
+  function findHtml(parts: EmailPart[]): string {
+    let plainFallback = '';
+    for (const part of parts) {
+      if (part.mimeType === 'text/html' && part.body?.data) return decodeBase64(part.body.data);
+      if (part.mimeType === 'text/plain' && part.body?.data) plainFallback = decodeBase64(part.body.data);
+      if (part.parts?.length) {
+        const nested = findHtml(part.parts);
+        if (nested) return nested;
+      }
     }
+    return plainFallback;
   }
-  return '';
+
+  return findHtml((payload.parts ?? []) as EmailPart[]);
 }
 
 function stripHtml(html: string): string {
@@ -262,10 +272,16 @@ function parseDiceTicket(msg: GmailMessage): Ticket | null {
   eventName = (enSubjectMatch?.[1] ?? frSubjectMatch?.[1] ?? dayOfEnMatch?.[1] ?? dayOfFrMatch?.[1] ?? transferMatch?.[1] ?? bodyEventMatch?.[1] ?? '').trim();
   if (!eventName) return null;
 
-  // Venue — EN: "Venue THE BROOKLYN MIRAGE" / FR: "Salle VENUE_NAME 123 addr"
-  const enVenueMatch = text.match(/Venue\s+([\w][\w\s'&@,-]{3,60?})(?=\s+\d{1,5}\s|\s*,\s*\d|\n|$)/i);
-  const frVenueMatch = text.match(/Salle\s+([\w][\w\s'&@,-]{3,60?})(?=\s+(?:Building\s+)?\d{1,5}|\n)/i);
-  const venue = (enVenueMatch?.[1] ?? frVenueMatch?.[1] ?? 'Venue TBD').trim();
+  // Venue — EN: "Venue NAME 123 Street" / FR: "Salle NAME 123 rue"
+  // Capture everything after "Venue"/"Salle" up to the first street number
+  // Capture venue name ending on a non-space char so trailing whitespace doesn't break the lookahead
+  const enVenueMatch = text.match(/\bVenue\s+([A-Za-z][^0-9\n]{2,79}[A-Za-z0-9])(?=\s+\d|\s*,\s*\d{5}|\s{3,}|$)/i);
+  const frVenueMatch = text.match(/\bSalle\s+([A-Za-z][^0-9\n]{2,79}[A-Za-z0-9])(?=\s+\d|\s*,\s*\d{5}|\s{3,}|$)/i);
+  const rawVenue = (enVenueMatch?.[1] ?? frVenueMatch?.[1] ?? '').trim().replace(/\s+/g, ' ').replace(/^Salle\s+/i, '');
+  // Reject city-only patterns, URLs, or junk text
+  const isCityOnly = /^[A-Za-z\s]+,\s*[A-Z]{2}$/.test(rawVenue);
+  const isJunk = /https?:|bit\.ly|requirements|click here/i.test(rawVenue);
+  const venue = (!isCityOnly && !isJunk && rawVenue) ? rawVenue : 'Venue TBD';
 
   // City — "Brooklyn, NY" or "Los Angeles, CA"
   const cityMatch = text.match(/([A-Za-z][A-Za-z\s]{2,25}),\s*(New York|NY|CA|IL|FL|TX|NJ|MA|WA|[A-Z]{2})\s+\d{5}/);
@@ -312,7 +328,8 @@ const AXS_SKIP = [
   /phone number updated/i,
   /ready to transfer/i,
   /your account has been/i,
-  /delivered to your account/i,   // generic delivery email — no event details inside
+  // Note: "delivered to your account" removed — some purchase confirmations use this phrase
+  // Instead we rely on rawName being null to skip emails with no event details
 ];
 
 function parseAxsTicket(msg: GmailMessage): Ticket | null {
@@ -320,8 +337,10 @@ function parseAxsTicket(msg: GmailMessage): Ticket | null {
   const get = (n: string) => headers.find((h) => h.name.toLowerCase() === n.toLowerCase())?.value ?? '';
   const subject = get('Subject').trim();
 
-  if (AXS_SKIP.some((r) => r.test(subject))) return null;
-  if (!/order|ticket/i.test(subject)) return null;
+  // Order confirmations always proceed even if they match a skip pattern (e.g. Amex Presale purchases)
+  const isOrderConfirmation = /thank you for your order|order details for/i.test(subject);
+  if (!isOrderConfirmation && AXS_SKIP.some((r) => r.test(subject))) return null;
+  if (!isOrderConfirmation && !/order|ticket/i.test(subject)) return null;
 
   const body = extractBody(msg.payload);
   const text = stripHtml(body);
@@ -336,14 +355,20 @@ function parseAxsTicket(msg: GmailMessage): Ticket | null {
 
   const rawName = (orderDetailsMatch?.[1] ?? thankYouMatch?.[1] ?? transferMatch?.[1])?.trim();
   if (!rawName) return null; // no event details found — skip email (e.g. "YOUR TICKETS ARE HERE" delivery notice)
-  let eventName = rawName.replace(/\s*[-–]\s*Amex Presale Tickets?[™®]?/i, '').trim();
+  let eventName = rawName
+    .replace(/\s*[-–]\s*Amex Presale Tickets?[™®]?/i, '')
+    .replace(/\s*[-–]\s*Artist Presale/i, '')
+    .replace(/\s*[-–]\s*Presale Tickets?[™®]?/i, '')
+    .trim();
 
   // Venue extraction:
   // Order format: "Order details for EVENT at VENUE scheduled on"
   // Transfer format: "for EVENT at VENUE, City, State on DAY"
+  // Also: "Thank you for your order for EVENT at VENUE on DATE"
   const venueFromOrder = text.match(/Order details for .+?\s+at\s+(.+?)\s+scheduled on/i);
-  const venueFromTransfer = text.match(/transferred \d+ tickets? to you for .+? at\s+([^,\n]{4,60}),/i);
-  const venue = (venueFromOrder?.[1] ?? venueFromTransfer?.[1])?.trim() ?? 'Venue TBD';
+  const venueFromTransfer = text.match(/transferred \d+ tickets? to you for .+? at\s+([^,\n]{4,80}?)(?:,\s*[A-Z]|$)/i);
+  const venueFromThankYou = text.match(/Thank you for your order for .+?\s+at\s+(.+?)\s+(?:on|scheduled)/i);
+  const venue = (venueFromOrder?.[1] ?? venueFromThankYou?.[1] ?? venueFromTransfer?.[1])?.trim() || 'Venue TBD';
 
   // City — from billing address or transfer line "VENUE, City, ST on"
   const cityFromTransfer = text.match(/transferred \d+ tickets? to you for .+? at [^,\n]+,\s*([^,\n]+),\s*([A-Z]{2})\s+on/i);
@@ -353,8 +378,10 @@ function parseAxsTicket(msg: GmailMessage): Ticket | null {
     : cityFromAddress ? `${cityFromAddress[1].trim()}, ${cityFromAddress[2]}` : '';
 
   // Confirmation number
-  const orderMatch = text.match(/confirmation number is\s+(\d+)/i) ?? text.match(/Order\s*#\s*(\d+)/i);
-  const orderNumber = orderMatch?.[1] ?? msg.id;
+  const orderMatch = text.match(/confirmation number is\s+(\d+)/i)
+    ?? text.match(/Order\s*#\s*([\d\-]+)/i)
+    ?? text.match(/confirmation\s+(?:number|code)\s*:?\s*([\d\-]{4,})/i);
+  const orderNumber = orderMatch?.[1] ?? '';
 
   // Date: "scheduled on 6/6/2026 7:00 PM" or "Saturday 11-25-23 at 7:30 pm"
   const schedMatch = text.match(/scheduled on\s+(\d{1,2}\/\d{1,2}\/\d{4})\s+(\d{1,2}:\d{2}\s*[AP]M)/i);
@@ -387,10 +414,18 @@ function parseAxsTicket(msg: GmailMessage): Ticket | null {
   const qtyMatch = text.match(/Quantity[^\d]*(\d+)/i);
   const quantity = qtyMatch ? parseInt(qtyMatch[1]) : 1;
 
-  // Section/Row/Seat
-  const sectionMatch = text.match(/Section\s+([A-Za-z0-9]+)/i);
-  const rowMatch = text.match(/Row\s+([A-Za-z0-9]+)/i);
-  const seatMatch = text.match(/Seat\s+([A-Za-z0-9]+)/i);
+  // Section/Row/Seat — AXS table format: "Quantity Section Row Seat(s) [qty] [section] [row] [seat]"
+  // The table headers appear before the values; parse values by matching the sequence after headers.
+  const tableMatch = text.match(/Quantity\s+Section\s+Row\s+Seats?\s+\d+\s+([A-Za-z][A-Za-z0-9 ]*?)\s+(N\/A|[A-Za-z0-9]+)\s+(\d+)/i);
+  const sectionVal = tableMatch?.[1]?.trim();
+  const rowValRaw = tableMatch?.[2]?.trim();
+  const seatVal = tableMatch?.[3]?.trim();
+  // Fallback for non-table formats
+  const sectionFallback = text.match(/Section\s*:\s*([A-Za-z0-9][A-Za-z0-9 ]*?)(?:\s+Row|\s*$)/i)?.[1]?.trim();
+  const rowFallbackRaw = text.match(/Row\s*:\s*([A-Za-z0-9\/]+)/i)?.[1]?.trim();
+  const sectionMatch = sectionVal ? [null, sectionVal] : sectionFallback ? [null, sectionFallback] : null;
+  const rowMatchVal = (rowValRaw && rowValRaw.toUpperCase() !== 'N/A') ? rowValRaw : (rowFallbackRaw && rowFallbackRaw.toUpperCase() !== 'N/A') ? rowFallbackRaw : null;
+  const seatMatch = seatVal ? [null, seatVal] : text.match(/Seat\s*:\s*([A-Za-z0-9]+)/i);
 
   return makeTicket({
     id: msg.id,
@@ -404,7 +439,7 @@ function parseAxsTicket(msg: GmailMessage): Ticket | null {
     orderNumber,
     confirmationEmailId: msg.id,
     section: sectionMatch?.[1],
-    row: rowMatch?.[1],
+    row: rowMatchVal ?? undefined,
     seat: seatMatch?.[1],
   });
 }
@@ -454,10 +489,17 @@ function parseTicketmasterTicket(msg: GmailMessage): Ticket | null {
   const eventName = (classicMatch?.[1] ?? resaleMatch?.[1])?.trim();
   if (!eventName) return null;
 
-  // ── Venue & city: "VENUE NAME — City, State" or "VENUE NAME - City, State" ──
-  const venueMatch = text.match(/([A-Za-z0-9][A-Za-z0-9\s'&().,-]{3,60}?)\s*[—–]\s*([A-Za-z\s]+,\s*[A-Za-z\s]+)/);
-  const venue = venueMatch?.[1]?.trim() ?? 'Venue TBD';
-  const city = venueMatch?.[2]?.trim() ?? '';
+  // ── Venue & city ──
+  // Format 1: "VENUE — City, State" (em dash or en dash)
+  // Must start with a letter to avoid capturing time fragments like "00 PM Red Bull Arena"
+  const dashVenue = text.match(/([A-Za-z][A-Za-z0-9\s'&().,-]{3,60}?)\s*[—–]\s*([A-Za-z][A-Za-z\s,]{5,60}?)(?=\s+(?:Get|View|Download|Important|$)|\s*\d)/);
+  // Format 2: "at VENUE\nCity, State" — venue on its own line before city
+  const atVenue = text.match(/\bat\s+([A-Za-z][A-Za-z0-9\s'&().,-]{3,60}?)(?=\s+(?:Harrison|Los Angeles|Brooklyn|New York|Maspeth|[A-Z][a-z]+,\s*[A-Z]{2}))/i);
+  const venueRaw = (dashVenue?.[1] ?? atVenue?.[1])?.trim() ?? '';
+  const venue = venueRaw.replace(/^(?:AM|PM)\s+/i, '') || 'Venue TBD';
+  // Trim city to "City, State" — drop any trailing words like "Get Directions"
+  const rawCity = dashVenue?.[2]?.trim() ?? '';
+  const city = rawCity.match(/^([A-Za-z][A-Za-z\s]{2,25},\s*[A-Za-z][A-Za-z\s]{2,25})/)?.[1]?.trim() ?? rawCity;
 
   // ── Date ──
   // Use email received date's year as fallback — prevents defaulting to current year
@@ -488,12 +530,15 @@ function parseTicketmasterTicket(msg: GmailMessage): Ticket | null {
 
   // ── Order number ──
   // "Order # 74-21547/NY1" or "Order #: 2900-0493-8281-5878-9"
-  const orderMatch = text.match(/Order\s*#:?\s*([\d\-\/A-Z]+)/i)
-    ?? subject.match(/Ticket Order\s+([\d\-]+)/i);
-  const orderNumber = orderMatch?.[1]?.trim() ?? msg.id;
+  // Require # or explicit keyword to avoid matching standalone years like "2022"
+  const orderMatch = text.match(/Order\s*[#:]\s*([\d\-\/A-Z]{5,})/i)
+    ?? text.match(/Order\s+(?:No\.?|Number)\s*:?\s*([\d\-\/A-Z]{5,})/i)
+    ?? subject.match(/Ticket Order\s+([\d\-]+)/i)
+    ?? text.match(/confirmation\s+(?:number|#|code)\s*:?\s*([\d\-A-Z]{5,})/i);
+  const orderNumber = orderMatch?.[1]?.trim() ?? '';
 
   // ── Quantity & seat info ──
-  const qtyMatch = text.match(/(\d+)\s+(?:General Admission|GA|ticket)/i);
+  const qtyMatch = text.match(/(\d+)\s+(?:General Admission|GA|tickets?\b)/i);
   const quantity = qtyMatch ? parseInt(qtyMatch[1]) : 1;
 
   // Section/Row/Seat
@@ -554,10 +599,10 @@ function parseStubhubTicket(msg: GmailMessage): Ticket | null {
   }
 
   // Venue: "Main Space at Knockdown Center - Complex, Maspeth"
-  // Pattern: "VENUE NAME - Complex, CITY" or just "VENUE NAME"
-  const venueMatch = text.match(/([A-Za-z0-9][A-Za-z0-9\s'&@.()-]{3,60}?)\s*-\s*Complex,/i)
-    ?? text.match(/([A-Za-z0-9][A-Za-z0-9\s'&@.()-]{3,60}?)\s*\n/i);
-  const venue = venueMatch?.[1]?.trim() ?? 'Venue TBD';
+  // Must start with a letter to avoid time fragments like "00 pm Main Space..."
+  const venueMatch = text.match(/([A-Za-z][A-Za-z0-9\s'&@.()-]{3,60}?)\s*-\s*Complex,/i);
+  const venueRaw = venueMatch?.[1]?.trim() ?? 'Venue TBD';
+  const venue = venueRaw.replace(/^(?:AM|PM)\s+/i, '') || 'Venue TBD';
 
   // City: "Complex, Maspeth" → Maspeth; or fallback from address
   const cityFromComplex = text.match(/Complex,\s*([A-Za-z][A-Za-z\s]+?)(?:\s*Order|\s*\n|$)/i);
@@ -567,9 +612,11 @@ function parseStubhubTicket(msg: GmailMessage): Ticket | null {
   const qtyMatch = text.match(/(\d+)\s+GA/i) ?? text.match(/Qty\s*:?\s*(\d+)/i) ?? text.match(/(\d+)\s+ticket/i);
   const quantity = qtyMatch ? parseInt(qtyMatch[1]) : 1;
 
-  // Section/Row
-  const sectionMatch = text.match(/(?:^|\s)([A-Z][A-Z\s0-9]{1,20})\s+(?:N\/A|[A-Z0-9]+)\s+\d+\s*-\s*\d+/m);
-  const rowMatch = text.match(/Row\s*:?\s*([A-Za-z0-9]+)/i);
+  // Section/Row/Seat from StubHub table: "Qty Section Row Seats / 1 GA ENTRY ANYTIME N/A 113 - 113"
+  // Capture section as everything between qty "1" and the row value (N/A or alphanumeric)
+  const sectionMatch = text.match(/\b1\s+([A-Z][A-Z\s]{2,50}?)\s+(?:N\/A|[A-Za-z0-9]+)\s+\d+\s*-\s*\d+/);
+  const rowRaw = text.match(/Row\s*:?\s*([A-Za-z0-9\/]+)/i)?.[1]?.trim();
+  const rowMatch = (rowRaw && rowRaw.toUpperCase() !== 'N/A') ? [null, rowRaw] : null;
 
   return makeTicket({
     id: msg.id,
@@ -681,7 +728,7 @@ export async function fetchTicketsFromGmail(accessToken: string): Promise<Ticket
     platformEntries.map(async ([platform, query]) => {
       const q = encodeURIComponent(query!);
       const res = await fetch(
-        `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${q}&maxResults=50`,
+        `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${q}&maxResults=100`,
         { headers: { Authorization: `Bearer ${accessToken}` } }
       );
       const data = await res.json() as { messages?: Array<{ id: string }>; error?: unknown };
@@ -730,13 +777,23 @@ export async function fetchTicketsFromGmail(accessToken: string): Promise<Ticket
   const validTickets = allTickets.filter((t) => !refundedEventNames.has(t.eventName.toLowerCase()));
 
   // Deduplicate: keyed by eventName+date so same event on different dates (e.g. two RÜFÜS nights) are kept separate.
+  // When same event+date has multiple orders (same platform), sum their quantities.
   // When same event+date appears on multiple platforms, prefer the primary ticketing platform.
   const PRIORITY: Record<Platform, number> = { dice: 5, axs: 4, ticketmaster: 3, tickpick: 2, stubhub: 1, eventbrite: 0, seatgeek: 0 };
   const best = new Map<string, Ticket>();
+  const quantities = new Map<string, number>();
   for (const t of validTickets) {
     const key = `${t.eventName.toLowerCase().trim()}|${t.date}`;
     const existing = best.get(key);
-    if (!existing || PRIORITY[t.platform] > PRIORITY[existing.platform]) best.set(key, t);
+    if (!existing || PRIORITY[t.platform] > PRIORITY[existing.platform]) {
+      best.set(key, t);
+    }
+    // Always accumulate quantity across all orders for the same event+date
+    quantities.set(key, (quantities.get(key) ?? 0) + t.quantity);
+  }
+  // Apply summed quantities
+  for (const [key, ticket] of best) {
+    best.set(key, { ...ticket, quantity: quantities.get(key) ?? ticket.quantity });
   }
 
   // Sort: upcoming first (soonest first), then past (most recent first).

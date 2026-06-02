@@ -77,14 +77,18 @@ export default function App() {
         }
       });
 
-      // Deduplicate across accounts by event name + date
-      const seen = new Set<string>();
-      const deduped = merged.filter((t) => {
+      // Deduplicate across accounts by event name + date, summing quantities
+      const dedupMap = new Map<string, Ticket>();
+      for (const t of merged) {
         const key = `${t.eventName.toLowerCase().trim()}|${t.date}`;
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      });
+        const existing = dedupMap.get(key);
+        if (existing) {
+          dedupMap.set(key, { ...existing, quantity: existing.quantity + t.quantity });
+        } else {
+          dedupMap.set(key, t);
+        }
+      }
+      const deduped = Array.from(dedupMap.values());
 
       // Re-sort after merge: upcoming soonest-first, then past most-recent-first.
       // Use same date-only string comparison as server. Tiebreak by time of day.
@@ -170,7 +174,28 @@ export default function App() {
               />
             </div>
 
-            {filtered.length === 0 ? (
+            {syncing && tickets.length === 0 ? (
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                {Array.from({ length: 6 }).map((_, i) => (
+                  <div
+                    key={i}
+                    className="flex flex-col gap-4 rounded-2xl border border-gray-200 bg-white p-5 dark:border-gray-700 dark:bg-gray-900"
+                  >
+                    <div className="h-6 w-24 animate-pulse rounded-full bg-gray-200 dark:bg-gray-700" />
+                    <div className="h-5 w-3/4 animate-pulse rounded bg-gray-200 dark:bg-gray-700" />
+                    <div className="flex flex-col gap-2">
+                      <div className="h-4 w-1/2 animate-pulse rounded bg-gray-100 dark:bg-gray-800" />
+                      <div className="h-4 w-2/3 animate-pulse rounded bg-gray-100 dark:bg-gray-800" />
+                      <div className="h-4 w-1/3 animate-pulse rounded bg-gray-100 dark:bg-gray-800" />
+                    </div>
+                    <div className="mt-auto flex items-center justify-between">
+                      <div className="h-6 w-16 animate-pulse rounded-full bg-gray-100 dark:bg-gray-800" />
+                      <div className="h-8 w-20 animate-pulse rounded-xl bg-gray-200 dark:bg-gray-700" />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : filtered.length === 0 ? (
               <p className="py-20 text-center text-gray-400 dark:text-gray-500">
                 No tickets match your filters.
               </p>

@@ -1,4 +1,4 @@
-import { Calendar, MapPin, Hash, Ticket as TicketIcon, ExternalLink } from 'lucide-react';
+import { Calendar, MapPin, Ticket as TicketIcon, ExternalLink } from 'lucide-react';
 import { format, parseISO } from 'date-fns';
 import type { Ticket } from '../types';
 import { PLATFORMS, openTicket } from '../lib/platforms';
@@ -60,10 +60,6 @@ export function TicketCard({ ticket }: Props) {
             </span>
           </div>
         )}
-        <div className="flex items-center gap-2">
-          <Hash size={14} className={`shrink-0 ${config.accentColor}`} />
-          <span className="font-mono text-xs truncate">{ticket.orderNumber}</span>
-        </div>
       </div>
 
       {/* Footer: quantity + CTA */}
