@@ -251,7 +251,8 @@ function parseDiceTicket(msg: GmailMessage): Ticket | null {
 
   if (DICE_SKIP.some((r) => r.test(subject))) return null;
 
-  const isPurchase = /^(Tes billets pour|Your tickets are sorted for)/i.test(subject);
+  // "Your tickets: EVENT" / "Tes billets : EVENT" is DICE's older delivery format
+  const isPurchase = /^(Tes billets pour|Your tickets are sorted for|Your tickets:|Tes billets\s*:)/i.test(subject);
   const isTransfer = /sent you .* ticket/i.test(subject);
   const isDayOf = /^(Get ready for|Prépare-toi pour|Aujourd'hui|Today at)/i.test(subject);
 
@@ -264,12 +265,14 @@ function parseDiceTicket(msg: GmailMessage): Ticket | null {
   let eventName = '';
   const enSubjectMatch = subject.match(/Your tickets are sorted for\s+(.+)/i);
   const frSubjectMatch = subject.match(/^Tes billets pour\s+(.+)/i);
+  const enColonMatch = subject.match(/^Your tickets:\s+(.+)/i);
+  const frColonMatch = subject.match(/^Tes billets\s*:\s+(.+)/i);
   const dayOfEnMatch = subject.match(/^Get ready for\s+(.+)/i);
   const dayOfFrMatch = subject.match(/^(?:Prépare-toi pour|Aujourd'hui [àa] \d+:\d+ :\s*)(.+)/i);
   const transferMatch = subject.match(/sent you .* tickets? for\s+(.+)/i);
   const bodyEventMatch = text.match(/(?:C'est dans la poche[^=]+==[^=]*==\s*|Purchase confirmation[^=]+==[^=]*==\s*)([^=]{3,80}?)\s*(?:==|Voir tes billets|View your tickets)/i);
 
-  eventName = (enSubjectMatch?.[1] ?? frSubjectMatch?.[1] ?? dayOfEnMatch?.[1] ?? dayOfFrMatch?.[1] ?? transferMatch?.[1] ?? bodyEventMatch?.[1] ?? '').trim();
+  eventName = (enSubjectMatch?.[1] ?? frSubjectMatch?.[1] ?? enColonMatch?.[1] ?? frColonMatch?.[1] ?? dayOfEnMatch?.[1] ?? dayOfFrMatch?.[1] ?? transferMatch?.[1] ?? bodyEventMatch?.[1] ?? '').trim();
   if (!eventName) return null;
 
   // Venue — EN: "Venue NAME 123 Street" / FR: "Salle NAME 123 rue"
