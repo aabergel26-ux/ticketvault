@@ -253,7 +253,9 @@ function parseDiceTicket(msg: GmailMessage): Ticket | null {
 
   // "Your tickets: EVENT" / "Tes billets : EVENT" is DICE's older delivery format
   const isPurchase = /^(Tes billets pour|Your tickets are sorted for|Your tickets:|Tes billets\s*:)/i.test(subject);
-  const isTransfer = /sent you .* ticket/i.test(subject);
+  // Transfer RECEIVED — EN: "X sent you tickets" / FR: "X t'a envoyé des/tes billets"
+  // (note: "Billet envoyé à Y" = transfer SENT — excluded via DICE_SKIP)
+  const isTransfer = /sent you .* ticket|t['’]a envoy[ée] (?:des|tes) billets/i.test(subject);
   const isDayOf = /^(Get ready for|Prépare-toi pour|Aujourd'hui|Today at)/i.test(subject);
 
   if (!isPurchase && !isTransfer && !isDayOf) return null;
@@ -270,9 +272,12 @@ function parseDiceTicket(msg: GmailMessage): Ticket | null {
   const dayOfEnMatch = subject.match(/^Get ready for\s+(.+)/i);
   const dayOfFrMatch = subject.match(/^(?:Prépare-toi pour|Aujourd'hui [àa] \d+:\d+ :\s*)(.+)/i);
   const transferMatch = subject.match(/sent you .* tickets? for\s+(.+)/i);
+  // Transfer event name lives in the BODY: FR "Tu as maintenant des billets pour EVENT"
+  // / EN "You now have tickets for EVENT"
+  const transferBodyMatch = text.match(/(?:Tu as maintenant des billets pour|You now have tickets for)\s+([^.!\n]{3,80}?)\s*[.!]/i);
   const bodyEventMatch = text.match(/(?:C'est dans la poche[^=]+==[^=]*==\s*|Purchase confirmation[^=]+==[^=]*==\s*)([^=]{3,80}?)\s*(?:==|Voir tes billets|View your tickets)/i);
 
-  eventName = (enSubjectMatch?.[1] ?? frSubjectMatch?.[1] ?? enColonMatch?.[1] ?? frColonMatch?.[1] ?? dayOfEnMatch?.[1] ?? dayOfFrMatch?.[1] ?? transferMatch?.[1] ?? bodyEventMatch?.[1] ?? '').trim();
+  eventName = (enSubjectMatch?.[1] ?? frSubjectMatch?.[1] ?? enColonMatch?.[1] ?? frColonMatch?.[1] ?? dayOfEnMatch?.[1] ?? dayOfFrMatch?.[1] ?? transferMatch?.[1] ?? transferBodyMatch?.[1] ?? bodyEventMatch?.[1] ?? '').trim();
   if (!eventName) return null;
 
   // Venue — EN: "Venue NAME 123 Street" / FR: "Salle NAME 123 rue"
