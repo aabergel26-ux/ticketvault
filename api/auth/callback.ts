@@ -7,6 +7,8 @@ const FRONTEND_URL = process.env.FRONTEND_URL!;
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   const code = req.query.code as string;
+  const state = req.query.state as string | undefined;
+  const mobileRedirect = state?.startsWith('mobile:') ? state.slice(7) : null;
   if (!code) return res.status(400).send('Missing code');
 
   const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
@@ -21,7 +23,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }),
   });
 
-  const tokens = await tokenRes.json() as { access_token: string; error?: string };
+  const tokens = await tokenRes.json() as { access_token: string; refresh_token?: string; error?: string };
   if (tokens.error) return res.status(400).send(tokens.error);
 
   const profileRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
@@ -29,7 +31,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   });
   const profile = await profileRes.json() as { email: string };
 
+  // refresh_token lets the apps mint fresh access tokens without re-login.
+  // Google only returns it because we request access_type=offline + prompt=consent.
+  const refresh = tokens.refresh_token ?? '';
+
+  if (mobileRedirect) {
+    // Redirect back to the mobile app's own URI (Expo Go or standalone)
+    const separator = mobileRedirect.includes('?') ? '&' : '?';
+    return res.redirect(
+      `${mobileRedirect}${separator}token=${tokens.access_token}&refresh=${encodeURIComponent(refresh)}&email=${encodeURIComponent(profile.email)}`
+    );
+  }
+
   res.redirect(
-    `${FRONTEND_URL}/auth/callback#access_token=${tokens.access_token}&email=${encodeURIComponent(profile.email)}`
+    `${FRONTEND_URL}/auth/callback#access_token=${tokens.access_token}&refresh_token=${encodeURIComponent(refresh)}&email=${encodeURIComponent(profile.email)}`
   );
 }
