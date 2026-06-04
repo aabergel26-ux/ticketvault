@@ -584,40 +584,65 @@ function parseStubhubTicket(msg: GmailMessage): Ticket | null {
   const orderMatch = subject.match(/Order\s*#(\d+)/i) ?? text.match(/Order\s*#(\d+)/i);
   const orderNumber = orderMatch?.[1] ?? msg.id;
 
-  // Event name — StubHub puts it standalone right before the date line:
-  //   "Wakyin\nSaturday, January 31, 2026 - 10:00 pm"
-  // After stripHtml: "... Wakyin Saturday, January 31, 2026 - 10:00 pm ..."
-  const eventBeforeDate = text.match(/([A-Z][A-Za-z0-9\s&'!:().-]{2,60}?)\s+(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\w*day,\s+\w+\s+\d{1,2},\s+\d{4}/i);
-  const eventName = eventBeforeDate?.[1]?.trim() ?? 'StubHub Event';
-  if (!eventBeforeDate) return null; // can't identify event
+  // StubHub uses two email templates:
+  //  A) event name BEFORE the date: "Wakyin  Saturday, January 31, 2026 - 10:00 pm"
+  //  B) older: "...Saturday, January 31, 2026 | 22:00 (Event time subject to change)
+  //     Wakyin  Main Space at Knockdown Center - Complex  2 Ticket(s)"
+  //     (date first, 24h time, event name in its own bold cell after the marker)
 
-  // Date: "Saturday, January 31, 2026 - 10:00 pm"
-  const dateMatch = text.match(/(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\w*day,\s+(\w+)\s+(\d{1,2}),\s+(\d{4})\s*[-–]\s*(\d{1,2}:\d{2}\s*[ap]m)/i);
+  // ── Event name ──
+  // Template A: event right before the weekday/date
+  const evA = text.match(/([A-Z][A-Za-z0-9\s&'!:().-]{2,60}?)\s+(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\w*day,\s+\w+\s+\d{1,2},\s+\d{4}/i);
+  // Template B: the bold cell that follows "(Event time subject to change)" in the HTML
+  const evB = body.match(/subject to change\)[\s\S]{0,800}?<span[^>]*>([^<]{2,60})<\/span>/i);
+  const eventName = (evA?.[1] ?? evB?.[1] ?? '').trim();
+  if (!eventName) return null; // can't identify event
+
+  // ── Date (both templates carry "Weekday, Month DD, YYYY") ──
+  const dMatch = text.match(/(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\w*day,\s+(\w+)\s+(\d{1,2}),\s+(\d{4})/i);
   let date = new Date().toISOString().split('T')[0];
-  let time = '8:00 PM';
-  if (dateMatch) {
-    const d = new Date(`${dateMatch[1]} ${dateMatch[2]}, ${dateMatch[3]}`);
+  if (dMatch) {
+    const d = new Date(`${dMatch[1]} ${dMatch[2]}, ${dMatch[3]}`);
     if (!isNaN(d.getTime())) date = d.toISOString().split('T')[0];
-    time = dateMatch[4];
+  }
+  // Time: 12h "- 10:00 pm" (A) or 24h "| 22:00" (B)
+  let time = '8:00 PM';
+  const t12 = text.match(/(\d{1,2}:\d{2})\s*([ap]m)/i);
+  const t24 = text.match(/\|\s*(\d{1,2}):(\d{2})\b/);
+  if (t12) {
+    time = `${t12[1]} ${t12[2].toUpperCase()}`;
+  } else if (t24) {
+    let h = parseInt(t24[1], 10); const m = t24[2];
+    const ap = h >= 12 ? 'PM' : 'AM';
+    if (h === 0) h = 12; else if (h > 12) h -= 12;
+    time = `${h}:${m} ${ap}`;
   }
 
-  // Venue: "Main Space at Knockdown Center - Complex, Maspeth"
-  // Must start with a letter to avoid time fragments like "00 pm Main Space..."
-  const venueMatch = text.match(/([A-Za-z][A-Za-z0-9\s'&@.()-]{3,60}?)\s*-\s*Complex,/i);
-  const venueRaw = venueMatch?.[1]?.trim() ?? 'Venue TBD';
-  const venue = venueRaw.replace(/^(?:AM|PM)\s+/i, '') || 'Venue TBD';
+  // ── Venue: "...- Complex," (A) or "...- Complex " (B, no comma) ──
+  let venueRaw = text.match(/([A-Za-z][A-Za-z0-9\s'&@.()-]{3,60}?)\s*-\s*Complex,/i)?.[1]?.trim() ?? '';
+  if (!venueRaw) {
+    // Template B: venue sits between the event name and "- Complex"
+    const afterEvent = eventName ? (text.split(eventName)[1] ?? text) : text;
+    venueRaw = afterEvent.match(/^\s*(.+?)\s*-\s*Complex\b/)?.[1]?.trim() ?? '';
+  }
+  venueRaw = venueRaw.replace(/^(?:AM|PM)\s+/i, '');
+  const venue = venueRaw || 'Venue TBD';
 
-  // City: "Complex, Maspeth" → Maspeth; or fallback from address
+  // City: "Complex, Maspeth" → Maspeth (template A only; B has no city)
   const cityFromComplex = text.match(/Complex,\s*([A-Za-z][A-Za-z\s]+?)(?:\s*Order|\s*\n|$)/i);
   const city = cityFromComplex?.[1]?.trim() ?? '';
 
-  // Quantity: "1 GA ENTRY" or from table row
-  const qtyMatch = text.match(/(\d+)\s+GA/i) ?? text.match(/Qty\s*:?\s*(\d+)/i) ?? text.match(/(\d+)\s+ticket/i);
+  // Quantity: "2 Ticket(s)" (B) / "1 GA" / "Qty: N"
+  const qtyMatch = text.match(/(\d+)\s+Ticket/i) ?? text.match(/(\d+)\s+GA/i) ?? text.match(/Qty\s*:?\s*(\d+)/i);
   const quantity = qtyMatch ? parseInt(qtyMatch[1]) : 1;
 
-  // Section/Row/Seat from StubHub table: "Qty Section Row Seats / 1 GA ENTRY ANYTIME N/A 113 - 113"
-  // Capture section as everything between qty "1" and the row value (N/A or alphanumeric)
-  const sectionMatch = text.match(/\b1\s+([A-Z][A-Z\s]{2,50}?)\s+(?:N\/A|[A-Za-z0-9]+)\s+\d+\s*-\s*\d+/);
+  // Section/Row/Seat
+  // Template B: "Section: General Admission Row: Seat(s): -"
+  const sectionB = text.match(/Section:\s*([A-Za-z][A-Za-z0-9\s]{2,40}?)\s*(?:Row:|Seat|$)/i)?.[1]?.trim();
+  // Template A table: "1 GA ENTRY ANYTIME N/A 113 - 113"
+  const sectionA = text.match(/\b1\s+([A-Z][A-Z\s]{2,50}?)\s+(?:N\/A|[A-Za-z0-9]+)\s+\d+\s*-\s*\d+/)?.[1]?.trim();
+  const sectionVal = sectionB ?? sectionA;
+  const sectionMatch = sectionVal ? [null, sectionVal] : null;
   const rowRaw = text.match(/Row\s*:?\s*([A-Za-z0-9\/]+)/i)?.[1]?.trim();
   const rowMatch = (rowRaw && rowRaw.toUpperCase() !== 'N/A') ? [null, rowRaw] : null;
 
