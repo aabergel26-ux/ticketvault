@@ -722,6 +722,42 @@ const PLATFORM_QUERIES: Record<Platform, string | null> = {
   seatgeek: null,
 };
 
+// Fetch JSON with retry/backoff on rate-limit (429) and transient 5xx errors.
+// Gmail rate-limits aggressively, so without this, concurrent message fetches
+// fail intermittently and tickets silently disappear from the results.
+async function fetchJsonWithRetry(
+  url: string,
+  accessToken: string,
+  retries = 4
+): Promise<any> {
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+    if ((res.status === 429 || res.status >= 500) && attempt < retries) {
+      const backoff = 250 * 2 ** attempt + Math.random() * 150;
+      await new Promise((r) => setTimeout(r, backoff));
+      continue;
+    }
+    return res.json();
+  }
+}
+
+// Run async work over a list with a bounded number of simultaneous tasks,
+// so we never flood the Gmail API and trip its rate limiter.
+async function mapWithConcurrency<T>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<void>
+): Promise<void> {
+  let cursor = 0;
+  async function worker() {
+    while (cursor < items.length) {
+      const idx = cursor++;
+      await fn(items[idx]);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+}
+
 export async function fetchTicketsFromGmail(accessToken: string): Promise<Ticket[]> {
   // Run one targeted search per platform so newsletters don't eat the result limit
   const platformEntries = (Object.entries(PLATFORM_QUERIES) as [Platform, string | null][])
@@ -730,12 +766,11 @@ export async function fetchTicketsFromGmail(accessToken: string): Promise<Ticket
   const messageIdSets = await Promise.all(
     platformEntries.map(async ([platform, query]) => {
       const q = encodeURIComponent(query!);
-      const res = await fetch(
+      const data = await fetchJsonWithRetry(
         `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${q}&maxResults=100`,
-        { headers: { Authorization: `Bearer ${accessToken}` } }
-      );
-      const data = await res.json() as { messages?: Array<{ id: string }>; error?: unknown };
-      console.log(`[${platform}] status:${res.status} found:${data.messages?.length ?? 0}`);
+        accessToken
+      ) as { messages?: Array<{ id: string }>; error?: unknown };
+      console.log(`[${platform}] found:${data.messages?.length ?? 0}`);
       return (data.messages ?? []).map((m) => ({ id: m.id, platform }));
     })
   );
@@ -747,34 +782,41 @@ export async function fetchTicketsFromGmail(accessToken: string): Promise<Ticket
   const allTickets: Ticket[] = [];
   const refundedEventNames = new Set<string>(); // track DICE refunds
 
-  await Promise.all(
-    allMessages.map(async ({ id, platform }) => {
-      const msgRes = await fetch(
-        `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full`,
-        { headers: { Authorization: `Bearer ${accessToken}` } }
-      );
-      const msg = await msgRes.json() as GmailMessage;
-      const subject = msg.payload?.headers?.find((h) => h.name.toLowerCase() === 'subject')?.value ?? '';
+  // Bounded concurrency (6 at a time) + retry keeps us under Gmail's rate limit
+  // so every candidate message is fetched and parsed on every run — making the
+  // result set deterministic instead of varying between syncs.
+  await mapWithConcurrency(allMessages, 10, async ({ id, platform }) => {
+    const msg = await fetchJsonWithRetry(
+      `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full`,
+      accessToken
+    ) as GmailMessage & { error?: unknown };
 
-      // Track DICE refunds — "Remboursement : 1 billet pour EVENT NAME"
-      if (platform === 'dice' && DICE_REFUND.test(subject)) {
-        const refundMatch = subject.match(/(?:Remboursement|Refund)\s*:\s*\d+\s+billet(?:s)?\s+pour\s+(.+)/i)
-          ?? subject.match(/(?:Remboursement|Refund)\s*:\s*(.+)/i);
-        if (refundMatch?.[1]) refundedEventNames.add(refundMatch[1].trim().toLowerCase());
-        return;
-      }
+    // If the fetch still failed after retries, skip rather than silently corrupt
+    if (!msg || !msg.payload) {
+      console.warn(`[fetch-fail] ${platform} message ${id} — no payload`);
+      return;
+    }
 
-      let ticket: Ticket | null = null;
-      if (platform === 'dice') ticket = parseDiceTicket(msg);
-      else if (platform === 'axs') ticket = parseAxsTicket(msg);
-      else if (platform === 'ticketmaster') ticket = parseTicketmasterTicket(msg);
-      else if (platform === 'stubhub') ticket = parseStubhubTicket(msg);
-      else if (platform === 'tickpick') ticket = parseTickpickTicket(msg);
+    const subject = msg.payload?.headers?.find((h) => h.name.toLowerCase() === 'subject')?.value ?? '';
 
-      console.log(`[parse] ${platform} | "${subject}" → ${ticket ? `✓ "${ticket.eventName}"` : 'skipped'}`);
-      if (ticket) allTickets.push(ticket);
-    })
-  );
+    // Track DICE refunds — "Remboursement : 1 billet pour EVENT NAME"
+    if (platform === 'dice' && DICE_REFUND.test(subject)) {
+      const refundMatch = subject.match(/(?:Remboursement|Refund)\s*:\s*\d+\s+billet(?:s)?\s+pour\s+(.+)/i)
+        ?? subject.match(/(?:Remboursement|Refund)\s*:\s*(.+)/i);
+      if (refundMatch?.[1]) refundedEventNames.add(refundMatch[1].trim().toLowerCase());
+      return;
+    }
+
+    let ticket: Ticket | null = null;
+    if (platform === 'dice') ticket = parseDiceTicket(msg);
+    else if (platform === 'axs') ticket = parseAxsTicket(msg);
+    else if (platform === 'ticketmaster') ticket = parseTicketmasterTicket(msg);
+    else if (platform === 'stubhub') ticket = parseStubhubTicket(msg);
+    else if (platform === 'tickpick') ticket = parseTickpickTicket(msg);
+
+    console.log(`[parse] ${platform} | "${subject}" → ${ticket ? `✓ "${ticket.eventName}"` : 'skipped'}`);
+    if (ticket) allTickets.push(ticket);
+  });
 
   // Remove refunded tickets
   const validTickets = allTickets.filter((t) => !refundedEventNames.has(t.eventName.toLowerCase()));
