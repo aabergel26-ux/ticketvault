@@ -77,18 +77,31 @@ export default function App() {
         }
       });
 
-      // Deduplicate across accounts by event name + date, summing quantities
-      const dedupMap = new Map<string, Ticket>();
+      // Deduplicate across accounts AND platforms.
+      // Reseller flow: you buy on StubHub, but the original vendor (DICE/AXS/TM)
+      // transfers the actual tickets — same tickets arrive as two confirmations
+      // (e.g. StubHub "Wakyin" + DICE "Wakyin & Guests"). Group by normalized
+      // name + date, keep the original-vendor record, take MAX quantity.
+      const PRIORITY: Record<string, number> = { dice: 5, axs: 4, ticketmaster: 3, tickpick: 2, stubhub: 1 };
+      const normalizeName = (n: string) => n.toLowerCase()
+        .replace(/\s*&\s*guests?\b/g, '')
+        .replace(/\s*\([^)]*\)\s*/g, ' ')
+        .replace(/[^a-z0-9]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      const groups = new Map<string, Ticket[]>();
       for (const t of merged) {
-        const key = `${t.eventName.toLowerCase().trim()}|${t.date}`;
-        const existing = dedupMap.get(key);
-        if (existing) {
-          dedupMap.set(key, { ...existing, quantity: existing.quantity + t.quantity });
-        } else {
-          dedupMap.set(key, t);
-        }
+        const key = `${normalizeName(t.eventName)}|${t.date}`;
+        const g = groups.get(key);
+        if (g) g.push(t); else groups.set(key, [t]);
       }
-      const deduped = Array.from(dedupMap.values());
+      const deduped = Array.from(groups.values()).map((group) => {
+        const rep = group.reduce(
+          (best, t) => (PRIORITY[t.platform] ?? 0) > (PRIORITY[best.platform] ?? 0) ? t : best,
+          group[0]
+        );
+        return { ...rep, quantity: Math.max(...group.map((t) => t.quantity)) };
+      });
 
       // Re-sort after merge: upcoming soonest-first, then past most-recent-first.
       // Use same date-only string comparison as server. Tiebreak by time of day.
