@@ -274,7 +274,7 @@ function parseDiceTicket(msg: GmailMessage): Ticket | null {
   const transferMatch = subject.match(/sent you .* tickets? for\s+(.+)/i);
   // Transfer event name lives in the BODY: FR "Tu as maintenant des billets pour EVENT"
   // / EN "You now have tickets for EVENT"
-  const transferBodyMatch = text.match(/(?:Tu as maintenant des billets pour|You now have tickets for)\s+([^.!\n]{3,80}?)\s*[.!]/i);
+  const transferBodyMatch = text.match(/(?:Tu as maintenant des billets pour|You now have tickets for|C'est dans la poche pour|Your tickets are sorted for)\s+([^.!\n]{3,80}?)\s*[.!]/i);
   const bodyEventMatch = text.match(/(?:C'est dans la poche[^=]+==[^=]*==\s*|Purchase confirmation[^=]+==[^=]*==\s*)([^=]{3,80}?)\s*(?:==|Voir tes billets|View your tickets)/i);
 
   eventName = (enSubjectMatch?.[1] ?? frSubjectMatch?.[1] ?? enColonMatch?.[1] ?? frColonMatch?.[1] ?? dayOfEnMatch?.[1] ?? dayOfFrMatch?.[1] ?? transferMatch?.[1] ?? transferBodyMatch?.[1] ?? bodyEventMatch?.[1] ?? '').trim();
@@ -494,8 +494,14 @@ function parseTicketmasterTicket(msg: GmailMessage): Ticket | null {
   const classicMatch = subject.match(/You Got Tickets To\s+(.+)/i);
   // Resale: "Your EVENT Ticket Order XXXX" — extract event before "Ticket Order"
   const resaleMatch = subject.match(/^Your\s+(.+?)\s+Ticket Order\s+[\d\-]/i);
-  const eventName = (classicMatch?.[1] ?? resaleMatch?.[1])?.trim();
+  let eventName = (classicMatch?.[1] ?? resaleMatch?.[1])?.trim();
   if (!eventName) return null;
+  // Strip Ticketmaster's age/ID qualifiers: "- 18 Years and Older with Valid ID to Enter",
+  // "- All Ages", "- 21 & Over", "- 18+", etc.
+  eventName = eventName
+    .replace(/\s*[-–]\s*\d+\s*(?:\+|&\s*(?:over|up)|years?\s+and\s+older).*$/i, '')
+    .replace(/\s*[-–]\s*all ages.*$/i, '')
+    .trim();
 
   // ── Venue & city ──
   // Format 1: "VENUE — City, State" (em dash or en dash)
