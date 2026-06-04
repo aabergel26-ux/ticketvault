@@ -612,7 +612,11 @@ function parseStubhubTicket(msg: GmailMessage): Ticket | null {
   const evA = text.match(/([A-Z][A-Za-z0-9\s&'!:().-]{2,60}?)\s+(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\w*day,\s+\w+\s+\d{1,2},\s+\d{4}/i);
   // Template B: the bold cell that follows "(Event time subject to change)" in the HTML
   const evB = body.match(/subject to change\)[\s\S]{0,800}?<span[^>]*>([^<]{2,60})<\/span>/i);
-  const eventName = (evA?.[1] ?? evB?.[1] ?? '').trim();
+  let eventName = (evA?.[1] ?? evB?.[1] ?? '').trim()
+    // Strip a leading month-year header that sometimes precedes the name,
+    // e.g. "January 2026 . Wakyin" -> "Wakyin"
+    .replace(/^[A-Z][a-z]+\s+\d{4}\s*[.·\-]\s*/, '')
+    .trim();
   if (!eventName) return null; // can't identify event
 
   // ── Date (both templates carry "Weekday, Month DD, YYYY") ──
