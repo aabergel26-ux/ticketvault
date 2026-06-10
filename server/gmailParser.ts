@@ -312,11 +312,6 @@ function parseDiceTicket(msg: GmailMessage): Ticket | null {
   const qtyMatch = text.match(/(?:Quantity|Billets|Quantit[eé])\s+(\d+)\s*[×x]?/i);
   const quantity = qtyMatch ? parseInt(qtyMatch[1]) : 1;
 
-  // Event artwork — DICE embeds the poster from their imgix CDN. Strip the
-  // mangled query string and request a sane width for the app.
-  const artMatch = body.match(/https:\/\/dice-media\.imgix\.net\/attachments\/[^"'\s?]+/i);
-  const imageUrl = artMatch ? `${artMatch[0]}?w=800&fm=jpg` : undefined;
-
   return makeTicket({
     id: msg.id,
     platform: 'dice',
@@ -328,7 +323,6 @@ function parseDiceTicket(msg: GmailMessage): Ticket | null {
     quantity,
     orderNumber: msg.id,
     confirmationEmailId: msg.id,
-    imageUrl,
   });
 }
 
