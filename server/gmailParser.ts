@@ -229,8 +229,8 @@ function parseDiceDate(text: string, emailYear?: number): { date: string; time: 
     };
   }
 
-  // ── "Date jeudi 14 mai, 2026" or "Date samedi 9 - dimanche 10, mai 2026"
-  const frFull = text.match(new RegExp(`Date\\s+(?:lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)\\s+(\\d{1,2})(?:\\s+-\\s+\\w+\\s+\\d{1,2})?,\\s*(${FR_MONTH_PAT})\\s+(\\d{4})`, 'i'));
+  // ── "Date samedi 9 mai 2026" or "Date samedi 9 - dimanche 10, mai 2026"
+  const frFull = text.match(new RegExp(`Date\\s+(?:lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)\\s+(\\d{1,2})(?:\\s+-\\s+\\w+\\s+\\d{1,2})?,?\\s*(${FR_MONTH_PAT})\\s+(\\d{4})`, 'i'));
   if (frFull) {
     const day = parseInt(frFull[1]);
     const month = resolveFrMonth(frFull[2]);
@@ -409,8 +409,13 @@ function parseAxsTicket(msg: GmailMessage): Ticket | null {
   let date = fallbackDate;
   let time = '8:00 PM';
   if (schedMatch) {
-    const d = new Date(schedMatch[1]);
-    if (!isNaN(d.getTime())) date = d.toISOString().split('T')[0];
+    // Parse explicitly to avoid timezone shift from new Date("M/D/YYYY") which
+    // interprets as UTC midnight and can drift a day in negative UTC offsets.
+    const parts = schedMatch[1].split('/');
+    const month = parseInt(parts[0]);
+    const day = parseInt(parts[1]);
+    const year = parseInt(parts[2]);
+    date = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
     time = schedMatch[2];
   } else if (altDateMatch) {
     // Parse explicitly to handle 2-digit years correctly (e.g. "12-21-22" → 2022)
@@ -639,19 +644,37 @@ function parseStubhubTicket(msg: GmailMessage): Ticket | null {
     time = `${h}:${m} ${ap}`;
   }
 
-  // ── Venue: "...- Complex," (A) or "...- Complex " (B, no comma) ──
+  // ── Venue: Try multiple patterns ──
+  // Pattern 1: "...VENUE - Complex," (Knockdown Center style)
   let venueRaw = text.match(/([A-Za-z][A-Za-z0-9\s'&@.()-]{3,60}?)\s*-\s*Complex,/i)?.[1]?.trim() ?? '';
   if (!venueRaw) {
-    // Template B: venue sits between the event name and "- Complex"
+    // Pattern 2: venue sits between the event name and "- Complex" (template B)
     const afterEvent = eventName ? (text.split(eventName)[1] ?? text) : text;
     venueRaw = afterEvent.match(/^\s*(.+?)\s*-\s*Complex\b/)?.[1]?.trim() ?? '';
+  }
+  if (!venueRaw) {
+    // Pattern 3: General — look for "at VENUE" or "VENUE · City" or "VENUE, City, ST"
+    const atMatch = text.match(/\bat\s+([A-Za-z][A-Za-z0-9\s'&@.()-]{3,60}?)(?:\s*[,·\-]\s*[A-Z][a-z]|\s+\d{1,2}\s+Ticket)/i);
+    if (atMatch) venueRaw = atMatch[1].trim();
+  }
+  if (!venueRaw) {
+    // Pattern 4: venue line between event name and date in template A
+    // "EVENT_NAME  VENUE_NAME  Weekday, Month DD, YYYY"
+    const betweenMatch = text.match(new RegExp(
+      eventName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') +
+      '\\s+([A-Za-z][A-Za-z0-9\\s\'&@.()-]{3,60}?)\\s+(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)', 'i'
+    ));
+    if (betweenMatch) venueRaw = betweenMatch[1].trim();
   }
   venueRaw = venueRaw.replace(/^(?:AM|PM)\s+/i, '');
   const venue = venueRaw || 'Venue TBD';
 
-  // City: "Complex, Maspeth" → Maspeth (template A only; B has no city)
+  // City: "Complex, Maspeth" → Maspeth (template A),
+  // or general "City, ST 12345" / "City, State" patterns
   const cityFromComplex = text.match(/Complex,\s*([A-Za-z][A-Za-z\s]+?)(?:\s*Order|\s*\n|$)/i);
-  const city = cityFromComplex?.[1]?.trim() ?? '';
+  const cityFromZip = text.match(/([A-Za-z][A-Za-z\s]{2,25}),\s*([A-Z]{2})\s+\d{5}/);
+  const city = cityFromComplex?.[1]?.trim()
+    ?? (cityFromZip ? `${cityFromZip[1].trim()}, ${cityFromZip[2]}` : '');
 
   // Quantity: "2 Ticket(s)" (B) / "1 GA" / "Qty: N"
   const qtyMatch = text.match(/(\d+)\s+Ticket/i) ?? text.match(/(\d+)\s+GA/i) ?? text.match(/Qty\s*:?\s*(\d+)/i);
@@ -755,6 +778,22 @@ function parseTickpickTicket(msg: GmailMessage): Ticket | null {
   });
 }
 
+// ─── Exports for testing ─────────────────────────────────────────────────────
+export {
+  stripHtml,
+  extractBody,
+  parseDiceDate,
+  parseDiceTicket,
+  parseAxsTicket,
+  parseTicketmasterTicket,
+  parseStubhubTicket,
+  parseTickpickTicket,
+  makeTicket,
+  detectPlatform,
+  timeToMinutes,
+};
+export type { GmailMessage };
+
 // ─── Main export ──────────────────────────────────────────────────────────────
 
 // Targeted per-platform Gmail search queries — subject filters cut through newsletters
@@ -828,7 +867,7 @@ export async function fetchTicketsFromGmail(accessToken: string): Promise<Ticket
   const allTickets: Ticket[] = [];
   const refundedEventNames = new Set<string>(); // track DICE refunds
 
-  // Bounded concurrency (6 at a time) + retry keeps us under Gmail's rate limit
+  // Bounded concurrency (10 at a time) + retry keeps us under Gmail's rate limit
   // so every candidate message is fetched and parsed on every run — making the
   // result set deterministic instead of varying between syncs.
   await mapWithConcurrency(allMessages, 10, async ({ id, platform }) => {
@@ -870,21 +909,23 @@ export async function fetchTicketsFromGmail(accessToken: string): Promise<Ticket
   // Deduplicate: keyed by eventName+date so same event on different dates (e.g. two RÜFÜS nights) are kept separate.
   // When same event+date has multiple orders (same platform), sum their quantities.
   // When same event+date appears on multiple platforms, prefer the primary ticketing platform.
+  // Deduplicate: same event+date across platforms (e.g. StubHub purchase + DICE transfer)
+  // should keep the primary-vendor record with the MAX quantity, not SUM — summing
+  // would double-count because both emails describe the same physical tickets.
   const PRIORITY: Record<Platform, number> = { dice: 5, axs: 4, ticketmaster: 3, tickpick: 2, stubhub: 1, eventbrite: 0, seatgeek: 0 };
   const best = new Map<string, Ticket>();
-  const quantities = new Map<string, number>();
   for (const t of validTickets) {
     const key = `${t.eventName.toLowerCase().trim()}|${t.date}`;
     const existing = best.get(key);
-    if (!existing || PRIORITY[t.platform] > PRIORITY[existing.platform]) {
+    if (!existing) {
       best.set(key, t);
+    } else if (PRIORITY[t.platform] > PRIORITY[existing.platform]) {
+      // Higher-priority platform wins; take the larger quantity across both
+      best.set(key, { ...t, quantity: Math.max(t.quantity, existing.quantity) });
+    } else {
+      // Same or lower priority — just update quantity if this one is larger
+      best.set(key, { ...existing, quantity: Math.max(t.quantity, existing.quantity) });
     }
-    // Always accumulate quantity across all orders for the same event+date
-    quantities.set(key, (quantities.get(key) ?? 0) + t.quantity);
-  }
-  // Apply summed quantities
-  for (const [key, ticket] of best) {
-    best.set(key, { ...ticket, quantity: quantities.get(key) ?? ticket.quantity });
   }
 
   // Sort: upcoming first (soonest first), then past (most recent first).
