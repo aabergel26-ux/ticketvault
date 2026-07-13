@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@google-cloud/local-auth": "^3.0.1",
+    "@supabase/supabase-js": "^2.110.2",
     "axios": "^1.16.1",
     "clsx": "^2.1.1",
     "cors": "^2.8.6",
@@ -23,7 +24,8 @@
     "node-fetch": "^3.3.2",
     "react": "^19.2.6",
     "react-dom": "^19.2.6",
-    "tailwind-merge": "^3.6.0"
+    "tailwind-merge": "^3.6.0",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

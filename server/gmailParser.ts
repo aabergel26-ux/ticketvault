@@ -1,4 +1,13 @@
-import type { Ticket, Platform } from '../src/types/index.js';
+import type { ParsedTicket, Platform } from '../src/types/index.js';
+
+const LOG_LEVEL = process.env.LOG_LEVEL ?? 'info';
+const LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
+
+function log(level: keyof typeof LEVELS, ...args: unknown[]) {
+  if (LEVELS[level] >= LEVELS[LOG_LEVEL as keyof typeof LEVELS]) {
+    console[level]('[gmailParser]', ...args);
+  }
+}
 
 const PLATFORM_SENDERS: Record<Platform, string[]> = {
   ticketmaster: ['ticketmaster.com', 'livenation.com'],
@@ -10,25 +19,6 @@ const PLATFORM_SENDERS: Record<Platform, string[]> = {
   seatgeek: [],
 };
 
-const PLATFORM_DEEP_LINKS: Record<Platform, (order: string) => string> = {
-  ticketmaster: (o) => `tmol://mytickets/${o}`,
-  axs: (_o) => `axs://mytickets`,
-  dice: (_o) => `dice://mytickets`,
-  stubhub: (o) => `stubhub://mytickets/${o}`,
-  tickpick: (_o) => `tickpick://mytickets`,
-  eventbrite: (o) => `eventbrite://tickets/${o}`,
-  seatgeek: (o) => `seatgeek://mytickets/${o}`,
-};
-
-const PLATFORM_WEB_URLS: Record<Platform, string> = {
-  ticketmaster: 'https://www.ticketmaster.com/user/orders',
-  axs: 'https://www.axs.com/myaccount/tickets',
-  dice: 'https://dice.fm/mytickets',
-  stubhub: 'https://www.stubhub.com/mytickets',
-  tickpick: 'https://www.tickpick.com/mytickets',
-  eventbrite: 'https://www.eventbrite.com/mytickets',
-  seatgeek: 'https://seatgeek.com/account/tickets',
-};
 
 interface GmailMessage {
   id: string;
@@ -91,16 +81,22 @@ function stripHtml(html: string): string {
     .trim();
 }
 
-function makeTicket(partial: Omit<Ticket, 'status' | 'deepLink' | 'webFallback'> & { platform: Platform }): Ticket {
-  // Use date-only comparison (YYYY-MM-DD string) to avoid server timezone drift
-  const today = new Date().toISOString().split('T')[0];
-  const isUpcoming = partial.date >= today;
-  return {
-    ...partial,
-    status: isUpcoming ? 'upcoming' : 'past',
-    deepLink: PLATFORM_DEEP_LINKS[partial.platform](partial.orderNumber),
-    webFallback: PLATFORM_WEB_URLS[partial.platform],
-  };
+function makeTicket(partial: {
+  id: string;
+  platform: Platform;
+  eventName: string;
+  venue: string;
+  city: string;
+  date: string;
+  time: string;
+  section?: string;
+  row?: string;
+  seat?: string;
+  quantity: number;
+  orderNumber: string;
+  confirmationEmailId: string;
+}): ParsedTicket {
+  return { ...partial };
 }
 
 function timeToMinutes(time: string): number {
@@ -196,7 +192,7 @@ function parseDiceDate(text: string, emailYear?: number): { date: string; time: 
     };
   }
 
-  const FR_MONTH_PAT = 'jan(?:v|ier)?\.?|f[ée]v(?:rier)?\.?|mars|avr(?:il)?\.?|mai|juin|juil(?:let)?\.?|ao[uû]t|sept(?:embre)?\.?|oct(?:obre)?\.?|nov(?:embre)?\.?|d[eé]c(?:embre)?\.?';
+  const FR_MONTH_PAT = 'jan(?:v|ier)?\\.?|f[ée]v(?:rier)?\\.?|mars|avr(?:il)?\\.?|mai|juin|juil(?:let)?\\.?|ao[uû]t|sept(?:embre)?\\.?|oct(?:obre)?\\.?|nov(?:embre)?\\.?|d[eé]c(?:embre)?\\.?';
   const resolveFrMonth = (raw: string) => {
     const key = raw.toLowerCase().replace(/\.$/, '').replace(/[éè]/g, 'e').replace(/[û]/g, 'u');
     for (const [k, v] of Object.entries(FRENCH_MONTHS)) {
@@ -244,7 +240,7 @@ function parseDiceDate(text: string, emailYear?: number): { date: string; time: 
   return { date: `${fallbackYear}-01-01`, time: '8:00 PM' };
 }
 
-function parseDiceTicket(msg: GmailMessage): Ticket | null {
+function parseDiceTicket(msg: GmailMessage): ParsedTicket | null {
   const headers = msg.payload?.headers ?? [];
   const get = (n: string) => headers.find((h) => h.name.toLowerCase() === n.toLowerCase())?.value ?? '';
   const subject = get('Subject').trim();
@@ -268,7 +264,6 @@ function parseDiceTicket(msg: GmailMessage): Ticket | null {
   if (!isPurchase && !isTransfer && !isDayOf) return null;
 
   // Event name — EN: "Your tickets are sorted for EVENT" / FR: in body "== EVENT =="
-  let eventName = '';
   const enSubjectMatch = subject.match(/Your tickets are sorted for\s+(.+)/i);
   const frSubjectMatch = subject.match(/^Tes billets pour\s+(.+)/i);
   const enColonMatch = subject.match(/^Your tickets:\s+(.+)/i);
@@ -283,7 +278,7 @@ function parseDiceTicket(msg: GmailMessage): Ticket | null {
   // Bare-subject confirmations: the subject itself is the event name
   const bareSubject = (bodyPurchase && !subjectPurchase && !isTransfer && !isDayOf) ? subject : undefined;
 
-  eventName = (enSubjectMatch?.[1] ?? frSubjectMatch?.[1] ?? enColonMatch?.[1] ?? frColonMatch?.[1] ?? dayOfEnMatch?.[1] ?? dayOfFrMatch?.[1] ?? transferMatch?.[1] ?? transferBodyMatch?.[1] ?? bodyEventMatch?.[1] ?? bareSubject ?? '').trim();
+  const eventName = (enSubjectMatch?.[1] ?? frSubjectMatch?.[1] ?? enColonMatch?.[1] ?? frColonMatch?.[1] ?? dayOfEnMatch?.[1] ?? dayOfFrMatch?.[1] ?? transferMatch?.[1] ?? transferBodyMatch?.[1] ?? bodyEventMatch?.[1] ?? bareSubject ?? '').trim();
   if (!eventName) return null;
 
   // Venue — EN: "Venue NAME 123 Street" / FR: "Salle NAME 123 rue"
@@ -346,7 +341,7 @@ const AXS_SKIP = [
   // Instead we rely on rawName being null to skip emails with no event details
 ];
 
-function parseAxsTicket(msg: GmailMessage): Ticket | null {
+function parseAxsTicket(msg: GmailMessage): ParsedTicket | null {
   const headers = msg.payload?.headers ?? [];
   const get = (n: string) => headers.find((h) => h.name.toLowerCase() === n.toLowerCase())?.value ?? '';
   const subject = get('Subject').trim();
@@ -369,7 +364,7 @@ function parseAxsTicket(msg: GmailMessage): Ticket | null {
 
   const rawName = (orderDetailsMatch?.[1] ?? thankYouMatch?.[1] ?? transferMatch?.[1])?.trim();
   if (!rawName) return null; // no event details found — skip email (e.g. "YOUR TICKETS ARE HERE" delivery notice)
-  let eventName = rawName
+  const eventName = rawName
     .replace(/\s*[-–]\s*Amex Presale Tickets?[™®]?/i, '')
     .replace(/\s*[-–]\s*Artist Presale/i, '')
     .replace(/\s*[-–]\s*Presale Tickets?[™®]?/i, '')
@@ -393,8 +388,8 @@ function parseAxsTicket(msg: GmailMessage): Ticket | null {
 
   // Confirmation number
   const orderMatch = text.match(/confirmation number is\s+(\d+)/i)
-    ?? text.match(/Order\s*#\s*([\d\-]+)/i)
-    ?? text.match(/confirmation\s+(?:number|code)\s*:?\s*([\d\-]{4,})/i);
+    ?? text.match(/Order\s*#\s*([\d\\-]+)/i)
+    ?? text.match(/confirmation\s+(?:number|code)\s*:?\s*([\d\\-]{4,})/i);
   const orderNumber = orderMatch?.[1] ?? '';
 
   // Date: "scheduled on 6/6/2026 7:00 PM" or "Saturday 11-25-23 at 7:30 pm"
@@ -441,7 +436,7 @@ function parseAxsTicket(msg: GmailMessage): Ticket | null {
   const seatVal = tableMatch?.[3]?.trim();
   // Fallback for non-table formats
   const sectionFallback = text.match(/Section\s*:\s*([A-Za-z0-9][A-Za-z0-9 ]*?)(?:\s+Row|\s*$)/i)?.[1]?.trim();
-  const rowFallbackRaw = text.match(/Row\s*:\s*([A-Za-z0-9\/]+)/i)?.[1]?.trim();
+  const rowFallbackRaw = text.match(/Row\s*:\s*([A-Za-z0-9\\/]+)/i)?.[1]?.trim();
   const sectionMatch = sectionVal ? [null, sectionVal] : sectionFallback ? [null, sectionFallback] : null;
   const rowMatchVal = (rowValRaw && rowValRaw.toUpperCase() !== 'N/A') ? rowValRaw : (rowFallbackRaw && rowFallbackRaw.toUpperCase() !== 'N/A') ? rowFallbackRaw : null;
   const seatMatch = seatVal ? [null, seatVal] : text.match(/Seat\s*:\s*([A-Za-z0-9]+)/i);
@@ -480,7 +475,7 @@ const TM_SKIP = [
   /upcoming concert lineup/i,
 ];
 
-function parseTicketmasterTicket(msg: GmailMessage): Ticket | null {
+function parseTicketmasterTicket(msg: GmailMessage): ParsedTicket | null {
   const headers = msg.payload?.headers ?? [];
   const get = (n: string) => headers.find((h) => h.name.toLowerCase() === n.toLowerCase())?.value ?? '';
   const subject = get('Subject').trim();
@@ -489,7 +484,7 @@ function parseTicketmasterTicket(msg: GmailMessage): Ticket | null {
 
   const isClassic = /you got tickets?/i.test(subject);
   // Resale format: "Your EVENT Ticket Order XXXX" — only valid if body says "Tickets Are Ready"
-  const isResaleOrder = /ticket order\s+[\d\-]+/i.test(subject);
+  const isResaleOrder = /ticket order\s+[\d\\-]+/i.test(subject);
   if (!isClassic && !isResaleOrder) return null;
 
   const body = extractBody(msg.payload);
@@ -504,7 +499,7 @@ function parseTicketmasterTicket(msg: GmailMessage): Ticket | null {
   // Classic: "You Got Tickets To EVENT NAME" in subject
   const classicMatch = subject.match(/You Got Tickets To\s+(.+)/i);
   // Resale: "Your EVENT Ticket Order XXXX" — extract event before "Ticket Order"
-  const resaleMatch = subject.match(/^Your\s+(.+?)\s+Ticket Order\s+[\d\-]/i);
+  const resaleMatch = subject.match(/^Your\s+(.+?)\s+Ticket Order\s+[\d\\-]/i);
   let eventName = (classicMatch?.[1] ?? resaleMatch?.[1])?.trim();
   if (!eventName) return null;
   // Strip Ticketmaster's age/ID qualifiers: "- 18 Years and Older with Valid ID to Enter",
@@ -556,9 +551,9 @@ function parseTicketmasterTicket(msg: GmailMessage): Ticket | null {
   // ── Order number ──
   // "Order # 74-21547/NY1" or "Order #: 2900-0493-8281-5878-9"
   // Require # or explicit keyword to avoid matching standalone years like "2022"
-  const orderMatch = text.match(/Order\s*[#:]\s*([\d\-\/A-Z]{5,})/i)
-    ?? text.match(/Order\s+(?:No\.?|Number)\s*:?\s*([\d\-\/A-Z]{5,})/i)
-    ?? subject.match(/Ticket Order\s+([\d\-]+)/i)
+  const orderMatch = text.match(/Order\s*[#:]\s*([\d\-\\/A-Z]{5,})/i)
+    ?? text.match(/Order\s+(?:No\.?|Number)\s*:?\s*([\d\-\\/A-Z]{5,})/i)
+    ?? subject.match(/Ticket Order\s+([\d\\-]+)/i)
     ?? text.match(/confirmation\s+(?:number|#|code)\s*:?\s*([\d\-A-Z]{5,})/i);
   const orderNumber = orderMatch?.[1]?.trim() ?? '';
 
@@ -592,7 +587,7 @@ function parseTicketmasterTicket(msg: GmailMessage): Ticket | null {
 // Keep: "Thanks for your order - Order #X"
 // Skip everything else
 
-function parseStubhubTicket(msg: GmailMessage): Ticket | null {
+function parseStubhubTicket(msg: GmailMessage): ParsedTicket | null {
   const headers = msg.payload?.headers ?? [];
   const get = (n: string) => headers.find((h) => h.name.toLowerCase() === n.toLowerCase())?.value ?? '';
   const subject = get('Subject').trim();
@@ -617,10 +612,10 @@ function parseStubhubTicket(msg: GmailMessage): Ticket | null {
   const evA = text.match(/([A-Z][A-Za-z0-9\s&'!:().-]{2,60}?)\s+(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\w*day,\s+\w+\s+\d{1,2},\s+\d{4}/i);
   // Template B: the bold cell that follows "(Event time subject to change)" in the HTML
   const evB = body.match(/subject to change\)[\s\S]{0,800}?<span[^>]*>([^<]{2,60})<\/span>/i);
-  let eventName = (evA?.[1] ?? evB?.[1] ?? '').trim()
+  const eventName = (evA?.[1] ?? evB?.[1] ?? '').trim()
     // Strip a leading month-year header that sometimes precedes the name,
     // e.g. "January 2026 . Wakyin" -> "Wakyin"
-    .replace(/^[A-Z][a-z]+\s+\d{4}\s*[.·\-]\s*/, '')
+    .replace(/^[A-Z][a-z]+\s+\d{4}\s*[.·\\-]\s*/, '')
     .trim();
   if (!eventName) return null; // can't identify event
 
@@ -654,7 +649,7 @@ function parseStubhubTicket(msg: GmailMessage): Ticket | null {
   }
   if (!venueRaw) {
     // Pattern 3: General — look for "at VENUE" or "VENUE · City" or "VENUE, City, ST"
-    const atMatch = text.match(/\bat\s+([A-Za-z][A-Za-z0-9\s'&@.()-]{3,60}?)(?:\s*[,·\-]\s*[A-Z][a-z]|\s+\d{1,2}\s+Ticket)/i);
+    const atMatch = text.match(/\bat\s+([A-Za-z][A-Za-z0-9\s'&@.()-]{3,60}?)(?:\s*[,·\\-]\s*[A-Z][a-z]|\s+\d{1,2}\s+Ticket)/i);
     if (atMatch) venueRaw = atMatch[1].trim();
   }
   if (!venueRaw) {
@@ -687,7 +682,7 @@ function parseStubhubTicket(msg: GmailMessage): Ticket | null {
   const sectionA = text.match(/\b1\s+([A-Z][A-Z\s]{2,50}?)\s+(?:N\/A|[A-Za-z0-9]+)\s+\d+\s*-\s*\d+/)?.[1]?.trim();
   const sectionVal = sectionB ?? sectionA;
   const sectionMatch = sectionVal ? [null, sectionVal] : null;
-  const rowRaw = text.match(/Row\s*:?\s*([A-Za-z0-9\/]+)/i)?.[1]?.trim();
+  const rowRaw = text.match(/Row\s*:?\s*([A-Za-z0-9\\/]+)/i)?.[1]?.trim();
   const rowMatch = (rowRaw && rowRaw.toUpperCase() !== 'N/A') ? [null, rowRaw] : null;
 
   return makeTicket({
@@ -711,7 +706,7 @@ function parseStubhubTicket(msg: GmailMessage): Ticket | null {
 //       "Your TickPick tickets are ready for delivery"
 // Skip everything else
 
-function parseTickpickTicket(msg: GmailMessage): Ticket | null {
+function parseTickpickTicket(msg: GmailMessage): ParsedTicket | null {
   const headers = msg.payload?.headers ?? [];
   const get = (n: string) => headers.find((h) => h.name.toLowerCase() === n.toLowerCase())?.value ?? '';
   const subject = get('Subject').trim();
@@ -814,7 +809,7 @@ async function fetchJsonWithRetry(
   url: string,
   accessToken: string,
   retries = 4
-): Promise<any> {
+): Promise<unknown> {
   for (let attempt = 0; ; attempt++) {
     const res = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
     if ((res.status === 429 || res.status >= 500) && attempt < retries) {
@@ -843,28 +838,32 @@ async function mapWithConcurrency<T>(
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
 }
 
-export async function fetchTicketsFromGmail(accessToken: string): Promise<Ticket[]> {
+// afterDate is a Gmail search date (YYYY/MM/DD) — when given, each platform
+// query is narrowed to `after:afterDate` so incremental syncs only fetch
+// messages received since the last sync instead of the full mailbox history.
+export async function fetchTicketsFromGmail(accessToken: string, afterDate?: string): Promise<ParsedTicket[]> {
   // Run one targeted search per platform so newsletters don't eat the result limit
   const platformEntries = (Object.entries(PLATFORM_QUERIES) as [Platform, string | null][])
     .filter(([, q]) => q !== null);
 
   const messageIdSets = await Promise.all(
     platformEntries.map(async ([platform, query]) => {
-      const q = encodeURIComponent(query!);
+      const fullQuery = afterDate ? `${query} after:${afterDate}` : query!;
+      const q = encodeURIComponent(fullQuery);
       const data = await fetchJsonWithRetry(
         `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${q}&maxResults=100`,
         accessToken
       ) as { messages?: Array<{ id: string }>; error?: unknown };
-      console.log(`[${platform}] found:${data.messages?.length ?? 0}`);
+      log('debug', `[${platform}] found:${data.messages?.length ?? 0}`);
       return (data.messages ?? []).map((m) => ({ id: m.id, platform }));
     })
   );
 
   const allMessages = messageIdSets.flat();
-  console.log('Total candidate messages:', allMessages.length);
+  log('debug', 'Total candidate messages:', allMessages.length);
   if (!allMessages.length) return [];
 
-  const allTickets: Ticket[] = [];
+  const allTickets: ParsedTicket[] = [];
   const refundedEventNames = new Set<string>(); // track DICE refunds
 
   // Bounded concurrency (10 at a time) + retry keeps us under Gmail's rate limit
@@ -878,7 +877,7 @@ export async function fetchTicketsFromGmail(accessToken: string): Promise<Ticket
 
     // If the fetch still failed after retries, skip rather than silently corrupt
     if (!msg || !msg.payload) {
-      console.warn(`[fetch-fail] ${platform} message ${id} — no payload`);
+      log('warn', `[fetch-fail] ${platform} message ${id} — no payload`);
       return;
     }
 
@@ -892,14 +891,14 @@ export async function fetchTicketsFromGmail(accessToken: string): Promise<Ticket
       return;
     }
 
-    let ticket: Ticket | null = null;
+    let ticket: ParsedTicket | null = null;
     if (platform === 'dice') ticket = parseDiceTicket(msg);
     else if (platform === 'axs') ticket = parseAxsTicket(msg);
     else if (platform === 'ticketmaster') ticket = parseTicketmasterTicket(msg);
     else if (platform === 'stubhub') ticket = parseStubhubTicket(msg);
     else if (platform === 'tickpick') ticket = parseTickpickTicket(msg);
 
-    console.log(`[parse] ${platform} | "${subject}" → ${ticket ? `✓ "${ticket.eventName}"` : 'skipped'}`);
+    log('debug', `[parse] ${platform} | "${subject}" → ${ticket ? `✓ "${ticket.eventName}"` : 'skipped'}`);
     if (ticket) allTickets.push(ticket);
   });
 
@@ -913,7 +912,7 @@ export async function fetchTicketsFromGmail(accessToken: string): Promise<Ticket
   // should keep the primary-vendor record with the MAX quantity, not SUM — summing
   // would double-count because both emails describe the same physical tickets.
   const PRIORITY: Record<Platform, number> = { dice: 5, axs: 4, ticketmaster: 3, tickpick: 2, stubhub: 1, eventbrite: 0, seatgeek: 0 };
-  const best = new Map<string, Ticket>();
+  const best = new Map<string, ParsedTicket>();
   for (const t of validTickets) {
     const key = `${t.eventName.toLowerCase().trim()}|${t.date}`;
     const existing = best.get(key);
@@ -931,7 +930,7 @@ export async function fetchTicketsFromGmail(accessToken: string): Promise<Ticket
   // Sort: upcoming first (soonest first), then past (most recent first).
   // Tiebreak same-date events by time of day.
   const now = new Date().toISOString().split('T')[0];
-  const byDateTime = (a: Ticket, b: Ticket) => {
+  const byDateTime = (a: ParsedTicket, b: ParsedTicket) => {
     const dateCmp = a.date.localeCompare(b.date);
     if (dateCmp !== 0) return dateCmp;
     return timeToMinutes(a.time) - timeToMinutes(b.time);

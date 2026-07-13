@@ -1,16 +1,81 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
+import crypto from 'node:crypto';
+import { upsertUser } from '../../server/db.js';
+import { encryptAuthCode } from '../../server/session.js';
 
 const CLIENT_ID = process.env.GOOGLE_CLIENT_ID!;
 const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET!;
 const REDIRECT_URI = process.env.REDIRECT_URI!;
 const FRONTEND_URL = process.env.FRONTEND_URL!;
 
+// Only allow redirects to known app schemes — prevents open redirect attacks.
+const ALLOWED_MOBILE_SCHEMES = [
+  'exp://',            // Expo Go during development
+  'ticketvault://',    // Standalone app custom scheme
+];
+
+function isAllowedMobileRedirect(uri: string): boolean {
+  return ALLOWED_MOBILE_SCHEMES.some((scheme) => uri.startsWith(scheme));
+}
+
+// Parse the state param and extract the nonce + optional mobile redirect.
+function parseState(state: string): { nonce: string; mobileRedirect: string | null } {
+  if (state.startsWith('mobile:')) {
+    // Format: "mobile:REDIRECT_URI:NONCE"
+    // The redirect URI may contain colons (exp://host:port), so split from the right:
+    // find the last colon — that separates the nonce from the redirect URI.
+    const afterPrefix = state.slice(7); // remove "mobile:"
+    const lastColon = afterPrefix.lastIndexOf(':');
+    if (lastColon === -1) return { nonce: afterPrefix, mobileRedirect: null };
+    return {
+      mobileRedirect: afterPrefix.slice(0, lastColon),
+      nonce: afterPrefix.slice(lastColon + 1),
+    };
+  }
+  return { nonce: state, mobileRedirect: null };
+}
+
+// Read a named cookie from the Cookie header.
+function getCookie(req: VercelRequest, name: string): string | null {
+  const header = req.headers.cookie ?? '';
+  const match = header.match(new RegExp(`(?:^|;\\s*)${name}=([^;]*)`));
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   const code = req.query.code as string;
-  const state = req.query.state as string | undefined;
-  const mobileRedirect = state?.startsWith('mobile:') ? state.slice(7) : null;
-  if (!code) return res.status(400).send('Missing code');
+  const stateParam = req.query.state as string | undefined;
 
+  if (!code) return res.status(400).send('Missing code');
+  if (!stateParam) return res.status(400).send('Missing state');
+
+  // ── CSRF verification ──────────────────────────────────────────────────────
+  const savedNonce = getCookie(req, 'tv_oauth_state');
+  const { nonce, mobileRedirect: mobileRedirectRaw } = parseState(stateParam);
+
+  if (!savedNonce || !crypto.timingSafeEqual(
+    Buffer.from(savedNonce), Buffer.from(nonce)
+  )) {
+    console.warn('[auth] CSRF state mismatch — rejecting callback');
+    return res.status(403).send('Invalid state parameter. Please try logging in again.');
+  }
+
+  // Clear the state cookie
+  res.setHeader('Set-Cookie', [
+    'tv_oauth_state=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0',
+  ]);
+
+  // ── Validate mobile redirect against allowlist ─────────────────────────────
+  const mobileRedirect = mobileRedirectRaw && isAllowedMobileRedirect(mobileRedirectRaw)
+    ? mobileRedirectRaw
+    : null;
+
+  if (mobileRedirectRaw && !mobileRedirect) {
+    console.warn(`[auth] Blocked disallowed mobile redirect: ${mobileRedirectRaw}`);
+    return res.status(400).send('Invalid redirect URI');
+  }
+
+  // ── Exchange code for tokens ───────────────────────────────────────────────
   const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -23,27 +88,48 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }),
   });
 
-  const tokens = await tokenRes.json() as { access_token: string; refresh_token?: string; error?: string };
+  const tokens = await tokenRes.json() as {
+    access_token: string;
+    refresh_token?: string;
+    expires_in?: number;
+    error?: string;
+  };
   if (tokens.error) return res.status(400).send(tokens.error);
 
+  // ── Get user profile ───────────────────────────────────────────────────────
   const profileRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
     headers: { Authorization: `Bearer ${tokens.access_token}` },
   });
   const profile = await profileRes.json() as { email: string };
 
-  // refresh_token lets the apps mint fresh access tokens without re-login.
-  // Google only returns it because we request access_type=offline + prompt=consent.
   const refresh = tokens.refresh_token ?? '';
 
+  // ── Store tokens server-side ────────────────────────────────────────────────
+  // Google tokens never leave the server from here on. `prompt: consent` (set
+  // in google.ts) means Google always issues a refresh_token, even on reconnect.
+  await upsertUser({
+    email: profile.email,
+    googleAccessToken: tokens.access_token,
+    googleRefreshToken: refresh || undefined,
+    tokenExpiresAt: tokens.expires_in
+      ? new Date(Date.now() + tokens.expires_in * 1000).toISOString()
+      : undefined,
+  });
+
+  // ── Redirect back to the app ───────────────────────────────────────────────
+  // Mobile flow is unchanged: tokens go directly to the app via a custom
+  // scheme redirect (never in browser history, unlike the web flow).
   if (mobileRedirect) {
-    // Redirect back to the mobile app's own URI (Expo Go or standalone)
     const separator = mobileRedirect.includes('?') ? '&' : '?';
     return res.redirect(
       `${mobileRedirect}${separator}token=${tokens.access_token}&refresh=${encodeURIComponent(refresh)}&email=${encodeURIComponent(profile.email)}`
     );
   }
 
-  res.redirect(
-    `${FRONTEND_URL}/auth/callback#access_token=${tokens.access_token}&refresh_token=${encodeURIComponent(refresh)}&email=${encodeURIComponent(profile.email)}`
-  );
+  // ── Web flow: encrypt a session identifier (the email) into a one-time code ─
+  // Google tokens never appear in the URL. The frontend POSTs the code to
+  // /api/auth/exchange, which returns a session token — not Google tokens.
+  const encryptedCode = encryptAuthCode(profile.email);
+
+  res.redirect(`${FRONTEND_URL}/auth/callback?code=${encodeURIComponent(encryptedCode)}`);
 }

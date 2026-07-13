@@ -3,15 +3,15 @@
     "target": "es2022",
     "module": "esnext",
     "moduleResolution": "bundler",
-    "outDir": ".",
     "rootDir": ".",
     "esModuleInterop": true,
     "skipLibCheck": true,
     "strict": false,
     "noEmit": false,
-    "declaration": false,
     "verbatimModuleSyntax": true,
-    "types": ["node"]
+    "types": ["node"],
+    "composite": true
   },
-  "files": ["server/gmailParser.ts"]
+  "files": ["server/gmailParser.ts", "server/db.ts", "server/session.ts", "server/rateLimit.ts"],
+  "include": ["src/types/index.ts"]
 }

@@ -1,17 +1,17 @@
-import type { Platform, Ticket } from '../types';
+import type { Platform, ParsedTicket, DisplayTicket } from '../types';
 
 export interface PlatformConfig {
   id: Platform;
   label: string;
-  badgeBg: string;       // Tailwind bg class for badge
-  badgeText: string;     // Tailwind text class for badge
-  accentColor: string;   // Tailwind text class for icons
-  buttonBg: string;      // Tailwind bg class for CTA button
-  buttonText: string;    // Tailwind text class for CTA button
+  badgeBg: string;
+  badgeText: string;
+  accentColor: string;
+  buttonBg: string;
+  buttonText: string;
   logo: string;
   senderDomains: string[];
   subjectPatterns: RegExp[];
-  buildDeepLink: (ticket: Partial<Ticket>) => string;
+  buildDeepLink: (ticket: Pick<ParsedTicket, 'orderNumber'>) => string;
   webBaseUrl: string;
 }
 
@@ -116,15 +116,39 @@ export const PLATFORMS: Record<Platform, PlatformConfig> = {
   },
 };
 
-export function openTicket(ticket: Ticket): void {
-  const config = PLATFORMS[ticket.platform];
-  const deepLink = config.buildDeepLink(ticket);
-  const webUrl = ticket.webFallback || config.webBaseUrl;
+// ─── Convert server ParsedTicket → client DisplayTicket ─────────────────────
+// This is a pure function of the parsed data + today's date + platform config.
+// Called at render time so status is always fresh. Never cached.
 
+export function toDisplayTicket(parsed: ParsedTicket): DisplayTicket {
+  const today = new Date().toISOString().split('T')[0];
+  const config = PLATFORMS[parsed.platform];
+  return {
+    ...parsed,
+    status: parsed.date >= today ? 'upcoming' : 'past',
+    deepLink: config.buildDeepLink(parsed),
+    webFallback: config.webBaseUrl,
+  };
+}
+
+// ─── Open ticket in native app or web ───────────────────────────────────────
+
+export function openTicket(ticket: DisplayTicket): void {
+  const config = PLATFORMS[ticket.platform];
+  const webUrl = ticket.webFallback || config.webBaseUrl;
   const isMobile = /iPhone|iPad|Android/i.test(navigator.userAgent);
 
   if (isMobile) {
+    // Try deep link, fall back to web after timeout
+    const deepLink = ticket.deepLink;
+    const start = Date.now();
     window.open(deepLink, '_blank');
+    setTimeout(() => {
+      // If the page is still visible after 1.5s, the deep link didn't open anything
+      if (document.visibilityState === 'visible' && Date.now() - start < 2000) {
+        window.open(webUrl, '_blank');
+      }
+    }, 1500);
   } else {
     window.open(webUrl, '_blank');
   }

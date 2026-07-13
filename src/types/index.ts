@@ -1,3 +1,4 @@
+// ─── Platform ────────────────────────────────────────────────────────────────
 export type Platform =
   | 'ticketmaster'
   | 'axs'
@@ -6,28 +7,45 @@ export type Platform =
   | 'tickpick'
   | 'eventbrite'
   | 'seatgeek';
-
-export interface Ticket {
+ 
+// ─── ParsedTicket — pure data from email parsing (server returns this) ──────
+// Contains only facts extracted from the email. No display state, no navigation
+// URLs. These are safe to cache because they never change.
+export interface ParsedTicket {
   id: string;
   platform: Platform;
   eventName: string;
   venue: string;
   city: string;
-  date: string; // ISO 8601
-  time: string;
+  date: string;            // YYYY-MM-DD
+  time: string;            // "7:00 PM"
   section?: string;
   row?: string;
   seat?: string;
   quantity: number;
   orderNumber: string;
-  confirmationEmailId: string; // Gmail message ID
-  deepLink: string;
-  webFallback: string;
+  confirmationEmailId: string;  // Gmail message ID — enables incremental sync
   imageUrl?: string;
   barcode?: string;
-  status: 'upcoming' | 'past' | 'cancelled';
 }
-
+ 
+// ─── DisplayTicket — client-side view model (computed at render time) ────────
+// Extends ParsedTicket with display-only fields that depend on "now" or on
+// client-side platform config. Never stored or cached.
+ 
+export interface DisplayTicket extends ParsedTicket {
+  status: 'upcoming' | 'past';
+  deepLink: string;
+  webFallback: string;
+}
+ 
+// ─── Backward compat alias ──────────────────────────────────────────────────
+// Components that previously imported `Ticket` get `DisplayTicket` — the shape
+// is a superset so everything still works.
+export type Ticket = DisplayTicket;
+ 
+// ─── Gmail types ─────────────────────────────────────────────────────────────
+ 
 export interface GmailMessage {
   id: string;
   threadId: string;
@@ -41,7 +59,7 @@ export interface GmailMessage {
     }>;
   };
 }
-
+ 
 export interface AuthState {
   isAuthenticated: boolean;
   userEmail: string | null;

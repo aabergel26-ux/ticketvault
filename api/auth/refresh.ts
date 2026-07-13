@@ -5,17 +5,21 @@ const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET!;
 
 /**
  * Exchanges a Google refresh token for a fresh access token.
- * The apps call this when a sync returns 401 (access token expired),
- * so the user never has to log in again.
+ * The web client no longer calls this — api/tickets.ts refreshes server-side
+ * using the token stored in Supabase. Kept for the mobile app, which still
+ * holds its own Google tokens directly (mobile auth flow is unchanged).
  */
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // Accept the refresh token from a JSON body or a query param
-  const refreshToken =
-    (req.body && (req.body as { refresh_token?: string }).refresh_token) ||
-    (req.query.refresh_token as string | undefined);
+  // POST only — refresh tokens must never appear in query strings (they'd leak
+  // into server logs, browser history, and Vercel's request logs).
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed. Use POST.' });
+  }
+
+  const refreshToken = (req.body as { refresh_token?: string } | undefined)?.refresh_token;
 
   if (!refreshToken) {
-    return res.status(400).json({ error: 'missing refresh_token' });
+    return res.status(400).json({ error: 'missing refresh_token in request body' });
   }
 
   const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
