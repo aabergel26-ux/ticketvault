@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@google-cloud/local-auth": "^3.0.1",
+    "@sentry/react": "^10.66.0",
     "@supabase/supabase-js": "^2.110.2",
     "axios": "^1.16.1",
     "clsx": "^2.1.1",

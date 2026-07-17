@@ -63,6 +63,12 @@ export function clearTicketCache() {
   localStorage.removeItem(CACHE_KEY);
 }
 
+export function clearCachedTicketsForAccount(email: string) {
+  const cache = loadTicketCache();
+  delete cache[email];
+  localStorage.setItem(CACHE_KEY, JSON.stringify(cache));
+}
+
 // ─── OAuth initiation ────────────────────────────────────────────────────────
 
 export function startGoogleAuth() {
@@ -147,15 +153,38 @@ export async function signOutAccounts(accounts: Account[]) {
   );
 }
 
+// Disconnects a single account: revokes its Google grant server-side (same
+// /api/auth/signout endpoint sign-out uses) and clears its cached tickets.
+// Removing it from the accounts list/localStorage is the caller's job, since
+// that's UI state App.tsx already owns.
+export async function removeAccount(account: Account) {
+  await signOutAccounts([account]);
+  clearCachedTicketsForAccount(account.email);
+}
+
 // ─── Fetch tickets with caching ──────────────────────────────────────────────
 // No client-side token refresh — the server refreshes the Google access token
 // against the value stored in Supabase and just returns the parsed tickets.
+// A 401 here means the server tried and couldn't (invalid session, or Google
+// refresh failed because the grant was revoked) — the caller should prompt
+// the user to reconnect rather than treating it like a transient failure.
+
+export class ReconnectRequiredError extends Error {
+  email: string;
+  constructor(email: string) {
+    super(`Account ${email} needs to be reconnected`);
+    this.email = email;
+  }
+}
 
 export async function fetchTicketsForAccount(account: Account): Promise<ParsedTicket[]> {
   const res = await fetch(`${SERVER}/api/tickets`, {
     headers: { Authorization: `Bearer ${account.sessionToken}` },
   });
 
+  if (res.status === 401) {
+    throw new ReconnectRequiredError(account.email);
+  }
   if (!res.ok) {
     throw new Error(`Failed to fetch tickets for ${account.email} (${res.status})`);
   }

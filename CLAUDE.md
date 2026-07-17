@@ -4,7 +4,7 @@
 A React/Vite web app + React Native iOS app that connects to Gmail via OAuth and surfaces ticket confirmations from Ticketmaster, AXS, DICE, and StubHub in a unified dashboard.
 
 ## Key URLs
-- **Web app (live):** https://ticketvault-delta.vercel.app
+- **Web app (live):** https://ticketvault-eight.vercel.app
 - **GitHub:** https://github.com/aabergel26-ux/ticketvault
 - **Native app:** ~/Desktop/TicketVaultApp (Expo Go / React Native)
 
@@ -12,9 +12,11 @@ A React/Vite web app + React Native iOS app that connects to Gmail via OAuth and
 - **Frontend:** React + Vite + TypeScript + Tailwind CSS v3
 - **API:** Vercel serverless functions in `api/`
 - **Email parsing:** `server/gmailParser.ts` (compiled to `server/gmailParser.js` before deploy)
-- **Auth:** Google OAuth 2.0, Gmail readonly scope, encrypted code exchange
+- **Persistence:** Supabase (Postgres) — `server/db.ts`. Users and their parsed tickets are stored server-side; Google tokens never reach the client.
+- **Auth:** Google OAuth 2.0, Gmail readonly scope, encrypted code exchange → opaque server-issued session token (`server/session.ts`)
+- **Error tracking:** Sentry (`@sentry/react`), initialized in `src/main.tsx`, wraps `<App />` in an error boundary
 - **Deploy:** `npx vercel --prod` (always run `npx tsc -p tsconfig.server.json` first to compile parser)
-- **Tests:** `npx tsx --test server/gmailParser.test.ts` (Node built-in test runner, 51 tests)
+- **Tests:** `npx tsx --test gmailParser.test.ts` (Node built-in test runner, 52 tests). Note: the test file lives at repo root, not `server/`.
 
 ## Critical Deploy Rule
 ALWAYS run `npx tsc -p tsconfig.server.json` before `npx vercel --prod`.
@@ -27,9 +29,13 @@ Requires **Node 22 LTS** (v22.x). Managed via nvm. Node 19 and earlier will fail
 - `GOOGLE_CLIENT_ID` — Google OAuth web client ID
 - `GOOGLE_CLIENT_SECRET` — Google OAuth client secret
 - `REDIRECT_URI` — OAuth callback URL
-- `FRONTEND_URL` — Web app URL (https://ticketvault-delta.vercel.app)
-- `TOKEN_ENCRYPTION_KEY` — 64-char hex string for AES-256-GCM token encryption
+- `FRONTEND_URL` — Web app URL (https://ticketvault-eight.vercel.app)
+- `TOKEN_ENCRYPTION_KEY` — 64-char hex string for AES-256-GCM encryption, shared by the auth-code handoff and the long-lived session token (`server/session.ts`)
   Generate with: `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`
+- `SUPABASE_URL` — Supabase project URL
+- `SUPABASE_SERVICE_KEY` — Supabase service role key (server-side only, never sent to the client)
+- `LOG_LEVEL` — optional, controls `server/gmailParser.ts` log verbosity (`debug`/`info`/`warn`/`error`, default `info`). Set to `warn` in production, `debug` locally.
+- `VITE_SENTRY_DSN` — Sentry DSN for error tracking (client-side, `src/main.tsx`). Currently blank/unset — no Sentry project created yet.
 
 ---
 
@@ -53,10 +59,11 @@ The server (`gmailParser.ts`) returns `ParsedTicket[]`. The client converts to `
 - Critical fix applied: quantity uses MAX across platforms (not SUM), because StubHub + DICE emails describe the same physical tickets
 
 ### Caching
-- `ParsedTicket[]` cached per-account email in localStorage
+- Two layers now: Supabase (`tickets` table, server-side, keyed by `user_id` + `gmail_message_id`) and `ParsedTicket[]` cached per-account email in the browser's localStorage
 - On app load: cached tickets render instantly (no skeleton), then background sync fetches fresh data
 - Cache populated automatically after every successful sync
-- Cache cleared on sign-out
+- Cache cleared on sign-out (all accounts) or on disconnecting a single account (`removeAccount()` in `auth.ts` clears just that account's entry)
+- If a fetch fails for one account (network error or unrefreshable token), that account's cached tickets are kept in the merged/displayed list rather than dropped — see "Per-account management" below
 
 ### Sort order
 - Upcoming: soonest first (date ascending)
@@ -66,26 +73,32 @@ The server (`gmailParser.ts`) returns `ParsedTicket[]`. The client converts to `
 
 ---
 
-## Security Architecture (Revised July 2026)
+## Security Architecture (Revised July 2026 — now with server-side sessions)
 
-### OAuth flow — encrypted code exchange
-Tokens never appear in URLs. The flow:
+### OAuth flow — Google tokens never leave the server
+Tokens never appear in URLs, and as of the Supabase migration, Google access/refresh tokens never reach the client at all — the client only ever holds an opaque server-issued session token. The flow:
 1. `google.ts` generates a CSRF nonce, stores it in an httpOnly cookie (5min TTL), passes it to Google as the `state` param
 2. Google redirects back to `callback.ts` with an authorization code
-3. `callback.ts` verifies the CSRF nonce (constant-time comparison), exchanges the code for tokens with Google, then encrypts `{access_token, refresh_token, email, expiresAt}` into an AES-256-GCM blob using `TOKEN_ENCRYPTION_KEY`
-4. Redirects to frontend with `?code=ENCRYPTED_BLOB` (not tokens)
+3. `callback.ts` verifies the CSRF nonce (constant-time comparison), exchanges the code for tokens with Google, then **upserts a user row in Supabase** (`server/db.ts`) storing the Google access token, refresh token, and expiry
+4. `callback.ts` encrypts just the user's **email** (not tokens) into a short-lived AES-256-GCM blob via `encryptAuthCode()` (`server/session.ts`), and redirects to the frontend with `?code=ENCRYPTED_BLOB`
 5. Frontend detects the code (`detectAuthCode()`), POSTs it to `exchange.ts`
-6. `exchange.ts` decrypts the blob, checks the 60-second expiry, returns tokens in the JSON response body
+6. `exchange.ts` decrypts the blob (60s TTL), looks up the user in Supabase, and returns a long-lived **session token** (`createSessionToken()`, 90-day TTL) — never the underlying Google tokens
+7. The client stores `{ email, sessionToken }` as its `Account` (see `Account` in `src/lib/auth.ts`) and sends `Authorization: Bearer <sessionToken>` on every `/api/tickets` call
 
 ### Mobile OAuth flow (unchanged)
-Mobile redirects go to custom app schemes (`exp://`, `ticketvault://`) which don't appear in browser history, so tokens are passed directly. Mobile redirects are validated against an allowlist to prevent open redirect attacks.
+Mobile redirects go to custom app schemes (`exp://`, `ticketvault://`) which don't appear in browser history, so tokens are passed directly. Mobile redirects are validated against an allowlist to prevent open redirect attacks. This flow still hands Google tokens straight to the app — it was not migrated to session tokens (see Pending Work).
 
 ### Token management
-- Refresh tokens stored in localStorage alongside access tokens
-- `fetchTicketsForAccount()` auto-retries with a fresh token on 401
-- Token refreshes persisted back to storage
-- Sign-out revokes Google tokens via `https://oauth2.googleapis.com/revoke`
-- `refresh.ts` is POST-only (refresh tokens never in query strings)
+- Google access/refresh tokens live only in Supabase (`users` table), never in the browser
+- The client holds a session token (localStorage, in the `Account` object) that maps to a Supabase user row — this is what `signOutAccounts`/`removeAccount` revoke server-side
+- No client-side token refresh. `api/tickets.ts` refreshes the Google access token itself (via `refreshGoogleAccessToken()`) whenever it's missing or within 60s of expiring, and persists the refreshed token back to Supabase
+- If refresh fails (revoked grant) or the session token is invalid/expired, `api/tickets.ts` returns 401. The client's `fetchTicketsForAccount()` throws a `ReconnectRequiredError` on 401, which `App.tsx` uses to flag that account as needing reconnection — see "Per-account management" below
+- Sign-out (`/api/auth/signout`, POST-only) revokes the Google grant via `https://oauth2.googleapis.com/revoke` using whichever token is on file, then deletes the Supabase user row (cascades to their cached tickets)
+- `refresh.ts` still exists and is POST-only, but the web client no longer calls it — kept for the mobile app, which still holds Google tokens directly
+
+### Rate limiting
+- `server/rateLimit.ts` — simple in-memory token-bucket, per Vercel function instance (resets on cold start; not a global limit)
+- Applied in `api/tickets.ts` (keyed by a SHA-256 hash of the session token, 20 req/min) and `api/auth/exchange.ts` (keyed by client IP, to slow brute-forcing of encrypted codes)
 
 ### CORS
 - `vercel.json` restricts `Access-Control-Allow-Origin` to the production frontend URL for all `/api/*` routes
@@ -93,6 +106,22 @@ Mobile redirects go to custom app schemes (`exp://`, `ticketvault://`) which don
 ### Deep link fallback
 - Mobile: tries native scheme, falls back to web URL after 1.5s if the page is still visible (app not installed)
 - Desktop: opens web URL directly
+
+### Client-side data validation
+- `src/lib/validators.ts` defines a Zod `ParsedTicketSchema`/`TicketResponseSchema`
+- `fetchTicketsForAccount()` in `auth.ts` parses every `/api/tickets` response through `TicketResponseSchema.safeParse()` before it touches app state — a malformed response logs an error and returns `[]` instead of crashing the UI
+
+### Per-account management
+- Each account pill in `Header.tsx` shows an X button (disconnect) normally, or an amber "Reconnect" button when that account's token can't be refreshed
+- Disconnecting calls `removeAccount()` (`auth.ts`): revokes via `/api/auth/signout`, clears that account's ticket cache, and the caller (`App.tsx`'s `handleRemoveAccount`) drops it from `accounts` state/localStorage
+- `App.tsx` tracks a separate `needsReconnect: Set<email>` state (deliberately not part of the persisted `Account` object, so updating it doesn't re-trigger the account-list sync effect). A 401 (`ReconnectRequiredError`) adds the email; a subsequent successful fetch removes it
+- Clicking "Reconnect" just calls `startGoogleAuth()` again — `callback.ts` already upserts onto the existing Supabase user row by email, so re-consenting refreshes that account's stored tokens in place
+
+### Error tracking
+- `@sentry/react`, initialized in `src/main.tsx` with `dsn: import.meta.env.VITE_SENTRY_DSN`
+- `<App />` is wrapped in `Sentry.ErrorBoundary` with a styled fallback UI (dark-mode aware) and a "Try again" reset button
+- No Sentry project exists yet — `VITE_SENTRY_DSN` is blank in `.env`; the SDK no-ops until it's set
+- Deliberately not using `@sentry/vercel` yet (no source maps wired up) — see Pending Work
 
 ---
 
@@ -149,9 +178,9 @@ Not yet built: eventbrite, seatgeek
 ---
 
 ## Test Suite
-- File: `server/gmailParser.test.ts`
-- Runner: `npx tsx --test server/gmailParser.test.ts`
-- 51 tests across 12 suites:
+- File: `gmailParser.test.ts` (repo root — moved out of `server/`)
+- Runner: `npx tsx --test gmailParser.test.ts`
+- 52 tests across 12 suites:
   - `stripHtml` — tag removal, entity decoding, whitespace collapsing
   - `timeToMinutes` — AM/PM edge cases, unparseable fallback
   - `detectPlatform` — all platforms + livenation alias
@@ -161,10 +190,11 @@ Not yet built: eventbrite, seatgeek
   - `parseTicketmasterTicket` — classic + resale, age qualifier stripping
   - `parseStubhubTicket` — template A, non-order skip
   - `parseTickpickTicket` — purchase confirmation, delivery skip
-  - `makeTicket` — returns ParsedTicket without display concerns
+  - `toDisplayTicket` — status/deepLink/webFallback computed correctly (renamed from `makeTicket` now that display concerns live client-side)
   - Dedup logic — MAX not SUM, platform priority
   - Sort logic — upcoming/past ordering, time-of-day tiebreaking
 - Test file has `/* eslint-disable */` and `// @ts-nocheck` at top (editor type-checking disabled; tests run via tsx directly)
+- No tests yet for `server/db.ts`, `server/session.ts`, `server/rateLimit.ts`, or `src/lib/validators.ts` — see Pending Work
 
 ---
 
@@ -174,29 +204,35 @@ Not yet built: eventbrite, seatgeek
 - `tsconfig.json` — root, references app + node + api
 - `tsconfig.app.json` — covers `src/`, browser types
 - `tsconfig.node.json` — covers `vite.config.ts`
-- `tsconfig.server.json` — covers `server/**/*.ts` + `src/types/index.ts`, emits JS
+- `tsconfig.server.json` — covers `server/gmailParser.ts`, `server/db.ts`, `server/session.ts`, `server/rateLimit.ts` + `src/types/index.ts`, emits JS
 - `api/tsconfig.json` — covers `api/**/*.ts`, Node types, noEmit (editor-only)
 
 ### Backend (`api/`)
 - `api/auth/google.ts` — starts OAuth, generates CSRF nonce cookie, passes state to Google
-- `api/auth/callback.ts` — verifies CSRF, exchanges code, encrypts tokens, redirects with ?code=BLOB
-- `api/auth/exchange.ts` — POST endpoint, decrypts code, checks 60s expiry, returns tokens in body
-- `api/auth/refresh.ts` — POST-only, exchanges refresh token for new access token
-- `api/tickets.ts` — endpoint apps call to get parsed tickets
+- `api/auth/callback.ts` — verifies CSRF, exchanges code with Google, **upserts the user + Google tokens into Supabase**, encrypts the user's email into a short-lived code, redirects with `?code=BLOB`
+- `api/auth/exchange.ts` — POST endpoint, decrypts the code, rate-limited by IP, looks up the Supabase user, returns a session token + email (never Google tokens)
+- `api/auth/signout.ts` — POST endpoint, verifies the session token, revokes the Google grant, deletes the Supabase user row (cascades to tickets). Used for both bulk sign-out and single-account disconnect
+- `api/auth/refresh.ts` — POST-only, exchanges refresh token for new access token. No longer called by the web client (kept for mobile)
+- `api/tickets.ts` — verifies session token, serves cached Supabase tickets if synced within 5 min, otherwise refreshes the Google token if needed, does an incremental Gmail sync (`after:` the last sync date), upserts new tickets into Supabase, and returns the full list
 - `api/debug.ts` — diagnostics endpoint
 
 ### Server (`server/`)
-- `server/gmailParser.ts` — Gmail search + per-platform parsers + dedup/sort (returns ParsedTicket[])
-- `server/gmailParser.test.ts` — 51 unit tests
+- `server/gmailParser.ts` — Gmail search + per-platform parsers + dedup/sort (returns ParsedTicket[]); `fetchTicketsFromGmail(accessToken, afterDate?)` takes an optional `YYYY/MM/DD` for incremental sync; internal logging goes through a `LOG_LEVEL`-gated `log()` helper instead of raw `console.*`
+- `server/db.ts` — Supabase client + CRUD: `upsertUser`, `getUserByEmail`, `deleteUserByEmail`, `updateLastSyncAt`, `upsertTickets`, `getTicketsByUser`
+- `server/session.ts` — AES-256-GCM envelope helpers built on `TOKEN_ENCRYPTION_KEY`: `encryptAuthCode`/`decryptAuthCode` (60s TTL, carries only an email) and `createSessionToken`/`verifySessionToken` (90-day TTL)
+- `server/rateLimit.ts` — in-memory per-instance token bucket, `checkRateLimit(key, maxRequests, windowMs)`
+- `server/index.ts` — legacy local-dev Express server (`npm run server`, port 3001). **Stale**: still implements the old direct-token-in-URL-hash OAuth flow, not session tokens/Supabase — see Pending Work
 
 ### Frontend (`src/`)
 - `src/types/index.ts` — ParsedTicket, DisplayTicket, Ticket (alias), Platform
-- `src/App.tsx` — main page: cache-first loading, async code exchange, dedup/sort, render grid
-- `src/lib/auth.ts` — detectAuthCode, exchangeAuthCode, fetchTicketsForAccount (auto-refresh), ticket caching
+- `src/main.tsx` — mounts `<App />`, initializes Sentry (`VITE_SENTRY_DSN`), wraps the tree in `Sentry.ErrorBoundary` with a fallback UI
+- `src/App.tsx` — main page: cache-first loading, async code exchange, dedup/sort, render grid; tracks `needsReconnect` (accounts whose 401s couldn't be resolved) separately from `accounts` state; `handleRemoveAccount()` disconnects a single account
+- `src/lib/auth.ts` — `Account` model (`{ email, sessionToken }`), `detectAuthCode`/`exchangeAuthCode`, `fetchTicketsForAccount` (throws `ReconnectRequiredError` on 401, Zod-validates the response), `signOutAccounts`/`removeAccount`, per-account ticket caching (`clearCachedTicketsForAccount`)
+- `src/lib/validators.ts` — Zod `ParsedTicketSchema`/`TicketResponseSchema` used to validate `/api/tickets` responses before they hit app state
 - `src/lib/platforms.ts` — platform configs, toDisplayTicket(), openTicket() with deep link fallback
 - `src/components/TicketCard.tsx` — one ticket card
 - `src/components/FilterBar.tsx` — Upcoming/Past/All + platform filters
-- `src/components/Header.tsx` — logo, account pills, sync, sign-out, dark mode
+- `src/components/Header.tsx` — logo, account pills (X to disconnect, amber "Reconnect" button when a token can't be refreshed), sync, sign-out, dark mode
 - `src/components/ConnectGmail.tsx` — onboarding CTA
 - `src/components/PlatformBadge.tsx` — colored platform label
 - `src/index.css` — Tailwind base with dark mode support (bg-gray-50 dark:bg-gray-950)
@@ -210,7 +246,7 @@ Not yet built: eventbrite, seatgeek
 
 ## Native App (~/Desktop/TicketVaultApp)
 - React Native + Expo SDK 54 (Expo Go compatible)
-- Auth: web bridge via deep link (ticketvault-delta.vercel.app/api/auth/google?mobile=1&mobileRedirect=...)
+- Auth: web bridge via deep link (ticketvault-eight.vercel.app/api/auth/google?mobile=1&mobileRedirect=...)
 - Mobile redirects validated against allowlist (exp://, ticketvault://)
 - Calls same Vercel API endpoints as web app
 - Screens: LoginScreen.tsx, TicketsScreen.tsx, TicketDetailScreen.tsx, SettingsScreen.tsx
@@ -224,15 +260,35 @@ Not yet built: eventbrite, seatgeek
 ---
 
 ## Pending Work
-- [ ] Set up TOKEN_ENCRYPTION_KEY env var in Vercel and deploy
-- [ ] Verify encrypted code exchange flow works end-to-end
-- [ ] Clean up console.log noise in gmailParser.ts (add LOG_LEVEL toggle)
-- [ ] Handle Vercel 30s timeout risk (pagination or background processing for large mailboxes)
+- [ ] Privacy policy + Terms of Service pages (`public/privacy.html`, `public/terms.html`) — required before Google OAuth production verification
+- [ ] Submit for Google OAuth verification (move consent screen from Testing to Production)
+- [ ] Create the actual Sentry project and set `VITE_SENTRY_DSN` in Vercel
+- [ ] Wire up `@sentry/vercel`/source maps once the Sentry project exists (deliberately skipped for now)
+- [ ] Report parser errors to Sentry server-side (`gmailParser.ts`, `api/tickets.ts` currently just `console.error`/`log('error', ...)`)
+- [ ] Migrate the mobile app (~/Desktop/TicketVaultApp) to the session-token flow — it still receives raw Google tokens directly via deep link, unlike the web client
+- [ ] Fix/replace `server/index.ts` — the local-dev Express server still implements the old direct-token OAuth flow (no Supabase, no session tokens), out of sync with `api/*`
+- [ ] Sync status indicators on account pills (green/yellow/red dot + last-sync tooltip) — per-account disconnect/reconnect shipped, but the visual sync-status part of the plan didn't
+- [ ] Add tests for `server/db.ts`, `server/session.ts`, `server/rateLimit.ts`, `src/lib/validators.ts` (currently only `gmailParser.ts`/`platforms.ts` logic is covered)
+- [ ] Rate-limit `api/auth/signout.ts` and `api/auth/refresh.ts` (currently only `api/tickets.ts` and `api/auth/exchange.ts` do)
+- [ ] Handle Vercel 30s timeout risk for very large/first-time mailboxes (incremental sync now covers *returning* users, but a first full sync can still be big — consider the queue/background-sync approach from the plan)
 - [ ] Push notifications for upcoming events
-- [ ] Multiple account management (remove individual accounts)
 - [ ] TestFlight build (needs Apple Developer account $99/year)
 - [ ] Sorting full verification against all 15 tickets
 - [ ] Teksupport: Rafael and Adriatique showing as upcoming — are these real new tickets?
+
+## Completed Work (Second July 2026 session — persistence & hardening)
+- [x] Added Supabase persistence (`server/db.ts`) — `users` and `tickets` tables, server-side token storage
+- [x] Migrated OAuth to server-side sessions — `callback.ts` upserts Supabase users, `exchange.ts` returns a session token instead of Google tokens, `server/session.ts` handles both the short-lived auth-code envelope and the long-lived session token
+- [x] Added `api/auth/signout.ts` — revokes the Google grant and deletes the Supabase user row; reused for both bulk sign-out and single-account disconnect
+- [x] Removed client-side token refresh — `api/tickets.ts` now refreshes the Google access token server-side and persists it back to Supabase
+- [x] Added incremental sync — `fetchTicketsFromGmail()` accepts an optional `afterDate`, `api/tickets.ts` serves straight from Supabase within a 5-minute freshness window and otherwise only re-queries Gmail for messages since the last sync
+- [x] Added `server/rateLimit.ts` — in-memory token bucket, applied to `api/tickets.ts` and `api/auth/exchange.ts`
+- [x] Added Zod validation (`src/lib/validators.ts`) — `fetchTicketsForAccount()` now validates every `/api/tickets` response before it reaches app state
+- [x] Added `LOG_LEVEL` toggle to `gmailParser.ts`, replacing raw `console.log`/`console.warn` calls
+- [x] Added per-account disconnect: X button on each pill in `Header.tsx`, `removeAccount()` in `auth.ts`, `handleRemoveAccount()` in `App.tsx`
+- [x] Added graceful handling of revoked tokens: `ReconnectRequiredError` on 401, `needsReconnect` state, amber "Reconnect" pill button, failed accounts fall back to cached tickets instead of disappearing
+- [x] Added Sentry (`@sentry/react`) — initialized in `main.tsx`, `<App />` wrapped in an error boundary with a styled fallback (DSN not yet provisioned)
+- [x] Moved `gmailParser.test.ts` to repo root; suite renamed `makeTicket` → `toDisplayTicket`, now 52 tests
 
 ## Completed Work (July 2026 session)
 - [x] Split Ticket type into ParsedTicket (server) + DisplayTicket (client)

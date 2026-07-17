@@ -14,7 +14,10 @@ import {
   saveAccounts,
   clearAccounts,
   signOutAccounts,
+  removeAccount,
   getAllCachedTickets,
+  getCachedTickets,
+  ReconnectRequiredError,
   type Account,
 } from './lib/auth';
 import './index.css';
@@ -116,6 +119,9 @@ export default function App() {
   }, [authCode]);
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Accounts whose token the server couldn't refresh (grant revoked, etc).
+  // Kept separate from `accounts` state so updating it doesn't re-trigger sync.
+  const [needsReconnect, setNeedsReconnect] = useState<Set<string>>(new Set());
   const [selectedPlatforms, setSelectedPlatforms] = useState<Platform[]>(ACTIVE_PLATFORMS);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('upcoming');
   const [darkMode, setDarkMode] = useState<boolean>(() => {
@@ -138,15 +144,34 @@ export default function App() {
     try {
       const results = await Promise.allSettled(accs.map((a) => fetchTicketsForAccount(a)));
 
-      // Merge results from all accounts
+      // Merge results from all accounts. A failed account falls back to its
+      // last cached tickets so the dashboard doesn't blank out while stale.
       const merged: ParsedTicket[] = [];
+      const reconnectEmails = new Set<string>();
+      const recoveredEmails = new Set<string>();
       results.forEach((r, i) => {
+        const email = accs[i].email;
         if (r.status === 'fulfilled') {
           merged.push(...r.value);
+          recoveredEmails.add(email);
         } else {
-          console.warn(`Failed to fetch tickets for ${accs[i].email}:`, r.reason);
+          if (r.reason instanceof ReconnectRequiredError) {
+            reconnectEmails.add(email);
+          } else {
+            console.warn(`Failed to fetch tickets for ${email}:`, r.reason);
+          }
+          merged.push(...getCachedTickets(email));
         }
       });
+
+      if (reconnectEmails.size > 0 || recoveredEmails.size > 0) {
+        setNeedsReconnect((prev) => {
+          const next = new Set(prev);
+          reconnectEmails.forEach((e) => next.add(e));
+          recoveredEmails.forEach((e) => next.delete(e));
+          return next;
+        });
+      }
 
       setTickets(dedupAndSort(merged));
     } catch {
@@ -172,6 +197,24 @@ export default function App() {
     setAccounts([]);
     setTickets([]);
   }
+  function handleRemoveAccount(email: string) {
+    const account = accounts.find((a) => a.email === email);
+    if (!account) return;
+
+    const next = accounts.filter((a) => a.email !== email);
+    saveAccounts(next);
+    setAccounts(next);
+    setTickets(dedupAndSort(getAllCachedTickets(next.map((a) => a.email))));
+    setNeedsReconnect((prev) => {
+      if (!prev.has(email)) return prev;
+      const nextSet = new Set(prev);
+      nextSet.delete(email);
+      return nextSet;
+    });
+
+    // Revoke server-side and clear the cache; fire-and-forget like sign-out.
+    removeAccount(account).catch(() => {});
+  }
   function togglePlatform(p: Platform) {
     setSelectedPlatforms((prev) =>
       prev.includes(p) ? prev.filter((x) => x !== p) : [...prev, p]
@@ -193,10 +236,13 @@ export default function App() {
     <div className="min-h-screen bg-gray-50 dark:bg-gray-950">
       <Header
         accounts={accounts}
+        needsReconnect={needsReconnect}
         ticketCount={tickets.filter((t) => t.status === 'upcoming').length}
         onSync={handleSync}
         onSignOut={handleSignOut}
         onAddAccount={handleAddAccount}
+        onRemoveAccount={handleRemoveAccount}
+        onReconnectAccount={handleAddAccount}
         syncing={syncing}
         darkMode={darkMode}
         onToggleDarkMode={() => setDarkMode((d) => !d)}

@@ -1,18 +1,33 @@
-import { Ticket, RefreshCw, LogOut, UserPlus, Sun, Moon } from 'lucide-react';
+import { Ticket, RefreshCw, LogOut, UserPlus, Sun, Moon, X } from 'lucide-react';
 import type { Account } from '../lib/auth';
 
 interface Props {
   accounts: Account[];
+  needsReconnect: Set<string>;
   ticketCount: number;
   onSync: () => void;
   onSignOut: () => void;
   onAddAccount: () => void;
+  onRemoveAccount: (email: string) => void;
+  onReconnectAccount: (email: string) => void;
   syncing: boolean;
   darkMode: boolean;
   onToggleDarkMode: () => void;
 }
 
-export function Header({ accounts, ticketCount, onSync, onSignOut, onAddAccount, syncing, darkMode, onToggleDarkMode }: Props) {
+export function Header({
+  accounts,
+  needsReconnect,
+  ticketCount,
+  onSync,
+  onSignOut,
+  onAddAccount,
+  onRemoveAccount,
+  onReconnectAccount,
+  syncing,
+  darkMode,
+  onToggleDarkMode,
+}: Props) {
   const isAuthenticated = accounts.length > 0;
 
   return (
@@ -35,14 +50,38 @@ export function Header({ accounts, ticketCount, onSync, onSignOut, onAddAccount,
           <>
             {/* Account pills */}
             <div className="hidden sm:flex flex-wrap items-center gap-1.5 mr-1">
-              {accounts.map((a) => (
-                <span
-                  key={a.email}
-                  className="rounded-full border border-gray-200 bg-gray-100 px-2.5 py-0.5 text-xs text-gray-600 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-300"
-                >
-                  {a.email}
-                </span>
-              ))}
+              {accounts.map((a) => {
+                const reconnecting = needsReconnect.has(a.email);
+                return (
+                  <span
+                    key={a.email}
+                    className={`flex items-center gap-1 rounded-full border py-0.5 pl-2.5 pr-1 text-xs ${
+                      reconnecting
+                        ? 'border-amber-300 bg-amber-50 text-amber-700 dark:border-amber-700 dark:bg-amber-900/30 dark:text-amber-300'
+                        : 'border-gray-200 bg-gray-100 text-gray-600 dark:border-gray-700 dark:bg-gray-800 dark:text-gray-300'
+                    }`}
+                  >
+                    {a.email}
+                    {reconnecting ? (
+                      <button
+                        onClick={() => onReconnectAccount(a.email)}
+                        title={`Reconnect ${a.email} — Gmail access was revoked`}
+                        className="rounded-full bg-amber-500 px-1.5 py-0.5 text-[10px] font-semibold text-white transition-colors hover:bg-amber-600"
+                      >
+                        Reconnect
+                      </button>
+                    ) : (
+                      <button
+                        onClick={() => onRemoveAccount(a.email)}
+                        title={`Disconnect ${a.email}`}
+                        className="rounded-full p-0.5 text-gray-400 transition-colors hover:bg-gray-200 hover:text-gray-700 dark:hover:bg-gray-700 dark:hover:text-gray-200"
+                      >
+                        <X size={12} />
+                      </button>
+                    )}
+                  </span>
+                );
+              })}
             </div>
 
             <button
