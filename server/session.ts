@@ -71,3 +71,21 @@ export function createSessionToken(email: string): string {
 export function verifySessionToken(token: string): { email: string } | null {
   return decrypt<Envelope & { email: string }>(token);
 }
+
+// ─── OAuth state signing (CSRF protection without cookies) ──────────────────
+// Vercel's redirect-heavy OAuth flow doesn't reliably persist a Set-Cookie
+// across the trip to Google and back, so instead of storing the nonce
+// server-side we sign it and let the signature travel in the `state` param
+// itself. callback.ts recomputes the HMAC and compares in constant time.
+
+export function signState(nonce: string): string {
+  const keyBuffer = Buffer.from(ENCRYPTION_KEY, 'hex');
+  return crypto.createHmac('sha256', keyBuffer).update(nonce).digest('hex');
+}
+
+export function verifyState(nonce: string, signature: string): boolean {
+  const expected = Buffer.from(signState(nonce), 'hex');
+  const actual = Buffer.from(signature, 'hex');
+  if (expected.length !== actual.length) return false;
+  return crypto.timingSafeEqual(expected, actual);
+}

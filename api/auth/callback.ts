@@ -1,7 +1,6 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import crypto from 'node:crypto';
 import { upsertUser } from '../../server/db.js';
-import { encryptAuthCode } from '../../server/session.js';
+import { encryptAuthCode, verifyState } from '../../server/session.js';
 
 const CLIENT_ID = process.env.GOOGLE_CLIENT_ID!;
 const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET!;
@@ -18,28 +17,22 @@ function isAllowedMobileRedirect(uri: string): boolean {
   return ALLOWED_MOBILE_SCHEMES.some((scheme) => uri.startsWith(scheme));
 }
 
-// Parse the state param and extract the nonce + optional mobile redirect.
-function parseState(state: string): { nonce: string; mobileRedirect: string | null } {
+// Parse the state param and extract the signed nonce ("nonce.signature") +
+// optional mobile redirect.
+function parseState(state: string): { signedNonce: string; mobileRedirect: string | null } {
   if (state.startsWith('mobile:')) {
-    // Format: "mobile:REDIRECT_URI:NONCE"
+    // Format: "mobile:REDIRECT_URI:NONCE.SIGNATURE"
     // The redirect URI may contain colons (exp://host:port), so split from the right:
-    // find the last colon — that separates the nonce from the redirect URI.
+    // find the last colon — that separates the signed nonce from the redirect URI.
     const afterPrefix = state.slice(7); // remove "mobile:"
     const lastColon = afterPrefix.lastIndexOf(':');
-    if (lastColon === -1) return { nonce: afterPrefix, mobileRedirect: null };
+    if (lastColon === -1) return { signedNonce: afterPrefix, mobileRedirect: null };
     return {
       mobileRedirect: afterPrefix.slice(0, lastColon),
-      nonce: afterPrefix.slice(lastColon + 1),
+      signedNonce: afterPrefix.slice(lastColon + 1),
     };
   }
-  return { nonce: state, mobileRedirect: null };
-}
-
-// Read a named cookie from the Cookie header.
-function getCookie(req: VercelRequest, name: string): string | null {
-  const header = req.headers.cookie ?? '';
-  const match = header.match(new RegExp(`(?:^|;\\s*)${name}=([^;]*)`));
-  return match ? decodeURIComponent(match[1]) : null;
+  return { signedNonce: state, mobileRedirect: null };
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -50,20 +43,24 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (!stateParam) return res.status(400).send('Missing state');
 
   // ── CSRF verification ──────────────────────────────────────────────────────
-  const savedNonce = getCookie(req, 'tv_oauth_state');
-  const { nonce, mobileRedirect: mobileRedirectRaw } = parseState(stateParam);
+  // No server-side storage of the nonce (a cookie set in google.ts doesn't
+  // reliably survive the round trip to Google on Vercel) — instead the state
+  // param carries "nonce.signature", and we recompute the HMAC here.
+  const { signedNonce, mobileRedirect: mobileRedirectRaw } = parseState(stateParam);
+  const dotIndex = signedNonce.lastIndexOf('.');
 
-  if (!savedNonce || !crypto.timingSafeEqual(
-    Buffer.from(savedNonce), Buffer.from(nonce)
-  )) {
-    console.warn('[auth] CSRF state mismatch — rejecting callback');
+  if (dotIndex === -1) {
+    console.warn('[auth] Malformed state parameter — rejecting callback');
     return res.status(403).send('Invalid state parameter. Please try logging in again.');
   }
 
-  // Clear the state cookie
-  res.setHeader('Set-Cookie', [
-    'tv_oauth_state=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0',
-  ]);
+  const nonce = signedNonce.slice(0, dotIndex);
+  const signature = signedNonce.slice(dotIndex + 1);
+
+  if (!verifyState(nonce, signature)) {
+    console.warn('[auth] CSRF state signature invalid — rejecting callback');
+    return res.status(403).send('Invalid state parameter. Please try logging in again.');
+  }
 
   // ── Validate mobile redirect against allowlist ─────────────────────────────
   const mobileRedirect = mobileRedirectRaw && isAllowedMobileRedirect(mobileRedirectRaw)
