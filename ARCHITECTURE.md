@@ -8,7 +8,7 @@ project context, ground-truth ticket list, and parsing-fix history.
 | Project | Folder | What it is |
 |---------|--------|-----------|
 | **Web app + API** | `~/ticketvault` | The website + the backend that reads Gmail |
-| **Native iOS app** | `~/Desktop/TicketVaultApp` | The iPhone app (Expo / React Native) |
+| **Native iOS app** | `mobile/` | The iPhone app (Expo / React Native), in this repo |
 
 ## Data flow
 
@@ -46,7 +46,7 @@ project context, ground-truth ticket list, and parsing-fix history.
          ├──────────────────────────┬──────────────────────────────┐
          ▼                          ▼
 ┌──────────────────────┐   ┌──────────────────────────────────────┐
-│   WEBSITE            │   │   iPHONE APP (~/Desktop/TicketVaultApp)│
+│   WEBSITE            │   │   iPHONE APP (mobile/)                 │
 │   (~/ticketvault/src)│   │                                        │
 │                      │   │   LoginScreen ──► TicketsScreen        │
 │   App.tsx            │   │                      │                 │
@@ -66,7 +66,7 @@ app display them.
 
 - 🧠 **"A ticket is parsed wrong"** → `server/gmailParser.ts`
   then `npx tsc -p tsconfig.server.json && npx vercel --prod`
-- 📱 **"The iPhone app looks/behaves wrong"** → `~/Desktop/TicketVaultApp/screens/`
+- 📱 **"The iPhone app looks/behaves wrong"** → `mobile/screens/`
   then reload in Expo Go
 - 🌐 **"The website looks wrong"** → `~/ticketvault/src/` then `npx vercel --prod`
 
@@ -88,7 +88,7 @@ app display them.
 - `lib/platforms.ts` — platform colors, deep links, Open button logic
 - `types/index.ts` — the `Ticket` data shape
 
-### iPhone app (`~/Desktop/TicketVaultApp`)
+### iPhone app (`mobile/`)
 - `App.tsx` — navigation (defines the 4 screens)
 - `screens/LoginScreen.tsx` — Connect Gmail
 - `screens/TicketsScreen.tsx` — main screen: header, account pills, filters, cards, sync, toast

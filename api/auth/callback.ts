@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { upsertUser } from '../../server/db.js';
-import { encryptAuthCode, verifyState } from '../../server/session.js';
+import { createSessionToken, encryptAuthCode, verifyState } from '../../server/session.js';
 
 const CLIENT_ID = process.env.GOOGLE_CLIENT_ID!;
 const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET!;
@@ -114,12 +114,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   });
 
   // ── Redirect back to the app ───────────────────────────────────────────────
-  // Mobile flow is unchanged: tokens go directly to the app via a custom
-  // scheme redirect (never in browser history, unlike the web flow).
+  // Mobile now gets the same server-issued session token as the web client —
+  // Google tokens stay server-side (already upserted into Supabase above) and
+  // never travel over the deep link. The custom scheme redirect (unlike the
+  // web flow's URL) never ends up in browser history, so this is still safe
+  // to send directly rather than going through the encrypted-code handoff.
   if (mobileRedirect) {
+    const sessionToken = createSessionToken(profile.email);
     const separator = mobileRedirect.includes('?') ? '&' : '?';
     return res.redirect(
-      `${mobileRedirect}${separator}token=${tokens.access_token}&refresh=${encodeURIComponent(refresh)}&email=${encodeURIComponent(profile.email)}`
+      `${mobileRedirect}${separator}token=${encodeURIComponent(sessionToken)}&email=${encodeURIComponent(profile.email)}`
     );
   }
 

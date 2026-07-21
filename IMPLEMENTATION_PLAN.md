@@ -360,7 +360,7 @@ export function checkRateLimit(
 **Why:** The React Native app still uses the old Ticket type, old auth
 flow, and has no caching.
 
-**Files to update in ~/Desktop/TicketVaultApp:**
+**Files to update in `mobile/`:**
 
 - `lib/types.ts` — Update to match the new ParsedTicket/DisplayTicket
   split. Add a `toDisplayTicket()` function (same logic as web).
@@ -378,7 +378,7 @@ flow, and has no caching.
 - `lib/types.ts` — Add the dedup/sort logic (same as web App.tsx
   `dedupAndSort` function).
 
-**Package to install (in TicketVaultApp):**
+**Package to install (in `mobile/`):**
 `npx expo install @react-native-async-storage/async-storage`
 
 ---
