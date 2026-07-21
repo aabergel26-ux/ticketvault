@@ -177,8 +177,11 @@ export class ReconnectRequiredError extends Error {
   }
 }
 
-export async function fetchTicketsForAccount(account: Account): Promise<ParsedTicket[]> {
-  const res = await fetch(`${SERVER}/api/tickets`, {
+async function fetchTicketResponse(
+  path: '/api/tickets' | '/api/sync',
+  account: Account
+): Promise<{ tickets: ParsedTicket[]; syncing: boolean }> {
+  const res = await fetch(`${SERVER}${path}`, {
     headers: { Authorization: `Bearer ${account.sessionToken}` },
   });
 
@@ -193,12 +196,29 @@ export async function fetchTicketsForAccount(account: Account): Promise<ParsedTi
   const result = TicketResponseSchema.safeParse(raw);
   if (!result.success) {
     console.error(`Invalid ticket data for ${account.email}:`, result.error);
-    return [];
+    return { tickets: [], syncing: false };
   }
-  const tickets = result.data;
+  return result.data;
+}
 
-  // Cache the fresh results
-  saveCachedTickets(account.email, tickets);
+// Two-step flow: /api/tickets returns instantly from Supabase and tells us
+// whether the cache is stale via `syncing`. If it is, we follow up with
+// /api/sync (which can take the full 30s) to pull fresh data from Gmail.
+// `onCachedTickets` lets the caller render the fast response immediately,
+// before the slower sync call (if any) resolves.
+export async function fetchTicketsForAccount(
+  account: Account,
+  onCachedTickets?: (tickets: ParsedTicket[]) => void
+): Promise<ParsedTicket[]> {
+  const cached = await fetchTicketResponse('/api/tickets', account);
+  saveCachedTickets(account.email, cached.tickets);
+  onCachedTickets?.(cached.tickets);
 
-  return tickets;
+  if (!cached.syncing) {
+    return cached.tickets;
+  }
+
+  const fresh = await fetchTicketResponse('/api/sync', account);
+  saveCachedTickets(account.email, fresh.tickets);
+  return fresh.tickets;
 }

@@ -21,4 +21,7 @@ export const ParsedTicketSchema = z.object({
   barcode: z.string().optional(),
 });
 
-export const TicketResponseSchema = z.array(ParsedTicketSchema);
+export const TicketResponseSchema = z.object({
+  tickets: z.array(ParsedTicketSchema),
+  syncing: z.boolean(),
+});

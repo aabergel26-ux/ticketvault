@@ -3,7 +3,8 @@
   "outputDirectory": "dist",
   "framework": "vite",
   "functions": {
-    "api/tickets.ts": { "maxDuration": 30 }
+    "api/tickets.ts": { "maxDuration": 30 },
+    "api/sync.ts": { "maxDuration": 30 }
   },
   "headers": [
     {

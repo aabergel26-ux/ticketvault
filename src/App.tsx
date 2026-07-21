@@ -141,18 +141,37 @@ export default function App() {
   const loadAllTickets = useCallback(async (accs: Account[]) => {
     setSyncing(true);
     setError(null);
-    try {
-      const results = await Promise.allSettled(accs.map((a) => fetchTicketsForAccount(a)));
 
-      // Merge results from all accounts. A failed account falls back to its
-      // last cached tickets so the dashboard doesn't blank out while stale.
-      const merged: ParsedTicket[] = [];
+    // Seed with local cache so switching accounts or re-syncing never blanks
+    // the screen, then update per-account as each account's fast (/api/tickets,
+    // Supabase-backed) and slow (/api/sync, only called when stale) responses
+    // arrive — so the UI reflects fresh data as soon as it's available instead
+    // of waiting for every account's full sync to finish.
+    const perAccount = new Map<string, ParsedTicket[]>(
+      accs.map((a) => [a.email, getCachedTickets(a.email)])
+    );
+    const render = () => setTickets(dedupAndSort(Array.from(perAccount.values()).flat()));
+    render();
+
+    try {
       const reconnectEmails = new Set<string>();
       const recoveredEmails = new Set<string>();
+
+      const results = await Promise.allSettled(
+        accs.map((a) =>
+          fetchTicketsForAccount(a, (cached) => {
+            perAccount.set(a.email, cached);
+            render();
+          })
+        )
+      );
+
+      // A failed account keeps whatever's already in perAccount (local cache,
+      // or the fast-path Supabase result if that succeeded before /api/sync failed).
       results.forEach((r, i) => {
         const email = accs[i].email;
         if (r.status === 'fulfilled') {
-          merged.push(...r.value);
+          perAccount.set(email, r.value);
           recoveredEmails.add(email);
         } else {
           if (r.reason instanceof ReconnectRequiredError) {
@@ -160,7 +179,6 @@ export default function App() {
           } else {
             console.warn(`Failed to fetch tickets for ${email}:`, r.reason);
           }
-          merged.push(...getCachedTickets(email));
         }
       });
 
@@ -173,7 +191,7 @@ export default function App() {
         });
       }
 
-      setTickets(dedupAndSort(merged));
+      render();
     } catch {
       setError('Could not load tickets. Try reconnecting.');
     } finally {
